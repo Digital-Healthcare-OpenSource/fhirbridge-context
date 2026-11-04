@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.vault.json
+*.vault.json.key
+*.key
+.fhirbridge/
+*.log
+.DS_Store

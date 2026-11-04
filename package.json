@@ -1,0 +1,79 @@
+{
+  "name": "fhirbridge",
+  "version": "0.1.0",
+  "description": "Zero-config CLI, SDK & MCP bridge that normalizes messy EHR FHIR R4 exports, applies reversible HIPAA Safe Harbor date-shifting, and compiles 300k-token bundles into verified 4k-token clinical context.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bin": {
+    "fhirbridge": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./normalizer": {
+      "types": "./dist/normalizer/index.d.ts",
+      "import": "./dist/normalizer/index.js"
+    },
+    "./deid": {
+      "types": "./dist/deid/index.d.ts",
+      "import": "./dist/deid/index.js"
+    },
+    "./compiler": {
+      "types": "./dist/compiler/index.d.ts",
+      "import": "./dist/compiler/index.js"
+    },
+    "./verifier": {
+      "types": "./dist/verifier/index.d.ts",
+      "import": "./dist/verifier/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "fhir",
+    "fhir-r4",
+    "hipaa",
+    "safe-harbor",
+    "de-identification",
+    "mcp",
+    "model-context-protocol",
+    "llm",
+    "clinical-nlp",
+    "sql-on-fhir",
+    "smart-on-fhir",
+    "healthcare"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Digital-Healthcare-OpenSource/fhirbridge-context.git"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "fixtures": "node scripts/generate-fixture.mjs",
+    "bench": "node scripts/benchmark.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "commander": "^15.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsup": "^9.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.1.0"
+  }
+}
