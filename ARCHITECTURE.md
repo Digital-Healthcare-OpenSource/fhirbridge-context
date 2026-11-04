@@ -64,10 +64,19 @@ These are enforced by code and covered by tests. Changes that weaken one need an
 
 ## Vault
 
-- File: JSON envelope `{format, version, kdf, salt?, iv, tag, ciphertext}`; AES-256-GCM with a
-  fresh 12-byte IV per save; v2 binds the header (format, version, kdf, salt) as AAD.
-- Keys: one master key → HKDF-SHA256 → separate `enc` and `hmac` subkeys (the HMAC key drives
-  date offsets and id pseudonyms).
+- File: JSON `{format, version, kdf, salt?, wrappedKey?, iv, tag, ciphertext}`; AES-256-GCM with a
+  fresh 12-byte IV per save; the header (format, version, kdf, salt, wrapped key) is bound as AAD.
+- Keys: one random master key → HKDF-SHA256 → separate `enc` and `hmac` subkeys (the HMAC key
+  drives date offsets, their store keys and id pseudonyms, so the master key must never change).
+- Passphrase vaults (v3) use envelope encryption: scrypt (N=2^17) derives a key-encryption key that
+  wraps the master key. Older v1/v2 passphrase files are re-wrapped on their next save with the
+  master key unchanged, so existing shifts and pseudonyms stay valid. Raw-key vaults
+  (`FHIRBRIDGE_VAULT_KEY`, key file) remain v2.
+- Permissions: every vault, temporary and key file is restricted to the current user before it
+  reaches its final path (`chmod 600`; on Windows `icacls /inheritance:r /grant:r <user>:(F)`).
+  Failure to restrict is a `VAULT_IO` error, never a silent fallback.
+- Rollback to an older valid vault file cannot be detected from the file alone; keep vault files
+  on storage you control.
 - Writes: `<vault>.lock` created with `wx`, stale after 30 s; a concurrent modification raises
   `VAULT_CONFLICT` instead of overwriting another writer's tokens. Atomic tmp-file + rename.
 

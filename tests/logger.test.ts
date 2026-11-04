@@ -29,6 +29,11 @@ describe('sanitizeValue', () => {
     ]) {
       expect(sanitizeValue(v)).toBe(REDACTED);
     }
+    for (const v of ['123-45-6789', '4155550142', '415-555-0142', 'MRN-4471902', '2024-03-05', '03/05/2024', 'a@b.co', 'Patient/7781234']) {
+      expect(sanitizeValue(v)).toBe(REDACTED);
+    }
+    expect(sanitizeValue('Observation/obs-301')).toBe('Observation/obs-301');
+    expect(sanitizeValue('v0.1.0')).toBe('v0.1.0');
     expect(sanitizeValue(Number.NaN)).toBeNull();
     expect(sanitizeValue(Number.POSITIVE_INFINITY)).toBeNull();
   });

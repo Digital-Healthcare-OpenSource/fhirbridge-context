@@ -38,12 +38,26 @@ const SAFE_STRING = /^[A-Za-z0-9_.:/@+-]{0,128}$/;
 const SAFE_KEY = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 export const REDACTED = '[redacted]';
 
+/** Identifier-shaped strings that are still likely PHI: e-mails, calendar dates, long digit runs. */
+const PHI_SHAPES: readonly RegExp[] = [
+  /@/, // e-mail addresses
+  /\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/, // 2024-03-05, 2024/3/5
+  /\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}/, // 03/05/2024, 5-3-24
+];
+const MAX_DIGITS = 6; // MRNs, SSNs and phone numbers carry 7+ digits
+
+function looksLikePhi(value: string): boolean {
+  if ((value.match(/\d/g)?.length ?? 0) > MAX_DIGITS) return true;
+  return PHI_SHAPES.some((re) => re.test(value));
+}
+
 /** Exported for tests: the exact sanitization applied to every value. */
 export function sanitizeValue(value: LogValue): string | number | boolean | null {
   if (value === undefined || value === null) return null;
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (typeof value === 'boolean') return value;
-  return typeof value === 'string' && SAFE_STRING.test(value) ? value : REDACTED;
+  if (typeof value !== 'string' || !SAFE_STRING.test(value) || looksLikePhi(value)) return REDACTED;
+  return value;
 }
 
 function sanitizeFields(fields: LogFields): Record<string, string | number | boolean | null> {

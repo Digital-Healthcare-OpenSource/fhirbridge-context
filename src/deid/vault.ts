@@ -23,6 +23,7 @@ import { createHmac } from 'node:crypto';
 import path from 'node:path';
 import { FhirBridgeError } from '../errors.js';
 import type { PhiCategory, VaultReader } from '../types/pipeline.js';
+import type { WrappedKey } from './key-wrap.js';
 import {
   assertKeyLength,
   atomicWrite,
@@ -82,6 +83,8 @@ export class SafeHarborVault implements VaultReader {
   private kdf: Kdf = 'raw';
   private salt?: Buffer;
   private version: VaultVersion = 2;
+  /** v3 passphrase vaults: the wrapped master key written into the header. */
+  private wrappedKey?: WrappedKey;
   /** Path + GCM tag of the file state this vault was loaded from / last saved as. */
   private baseline?: { file: string; tag: string | undefined };
 
@@ -107,6 +110,7 @@ export class SafeHarborVault implements VaultReader {
     vault.kdf = resolved.kdf;
     vault.salt = resolved.salt;
     vault.version = resolved.version;
+    vault.wrappedKey = resolved.wrappedKey;
     vault.baseline = { file: path.resolve(file), tag: existing?.tag };
     if (existing) vault.load(existing);
     return vault;
@@ -135,6 +139,7 @@ export class SafeHarborVault implements VaultReader {
         version: this.version,
         kdf: this.kdf,
         salt: this.salt,
+        wrappedKey: this.wrappedKey,
       });
       await atomicWrite(target, JSON.stringify(out, null, 2), 0o600);
       this.baseline = { file: resolved, tag: out.tag };

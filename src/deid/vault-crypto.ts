@@ -2,10 +2,14 @@
  * Vault file format, key resolution and file locking.
  *
  * File versions:
- *   v1  scrypt N=2^15, GCM AAD = "fhirbridge-vault:v1" (read, and kept on save for scrypt files
- *       because their key was derived with the v1 parameters)
- *   v2  scrypt N=2^17, GCM AAD binds [format, version, kdf, salt] so a tampered header fails
- *       authentication
+ *   v1  scrypt N=2^15 derives the master key directly; constant GCM AAD (read only)
+ *   v2  raw-key vaults (FHIRBRIDGE_VAULT_KEY / key file); legacy v2 passphrase files derived the
+ *       master key with scrypt N=2^17 (read only). AAD binds [format, version, kdf, salt].
+ *   v3  passphrase vaults: scrypt N=2^17 derives a KEK that wraps a random master key (envelope).
+ *       AAD binds [format, version, kdf, salt, wrappedKey]. v1/v2 passphrase vaults are upgraded to
+ *       v3 on their next save WITHOUT changing the master key, so date shifts and pseudonyms that
+ *       are keyed by HMAC of the master key stay stable.
+ * Every write is restricted to the current user (chmod 600 / owner-only ACL on Windows).
  */
 import {
   createCipheriv,
@@ -17,6 +21,8 @@ import {
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { FhirBridgeError } from '../errors.js';
+import { restrictToOwner } from './file-permissions.js';
+import { isWrappedKey, unwrapKey, wrapKey, type WrappedKey } from './key-wrap.js';
 
 export const VAULT_KEY_ENV = 'FHIRBRIDGE_VAULT_KEY';
 export const VAULT_PASSPHRASE_ENV = 'FHIRBRIDGE_VAULT_PASSPHRASE';
@@ -31,13 +37,15 @@ const LOCK_RETRY_MS = 50;
 const LOCK_STALE_MS = 30_000;
 
 export type Kdf = 'scrypt' | 'raw';
-export type VaultVersion = 1 | 2;
+export type VaultVersion = 1 | 2 | 3;
 
 export interface VaultFile {
   format: typeof FORMAT;
   version: VaultVersion;
   kdf: Kdf;
   salt?: string;
+  /** v3 only: master key wrapped by the passphrase-derived KEK. */
+  wrappedKey?: WrappedKey;
   iv: string;
   tag: string;
   ciphertext: string;
@@ -61,6 +69,8 @@ export interface ResolvedKey {
   salt?: Buffer;
   /** Version written on save. */
   version: VaultVersion;
+  /** v3: wrapped master key written into the header on save. */
+  wrappedKey?: WrappedKey;
 }
 
 export function deriveVaultSubkeys(masterKey: Buffer): VaultSubkeys {
@@ -102,9 +112,12 @@ export async function atomicWrite(file: string, data: string, mode: number): Pro
   try {
     await mkdir(path.dirname(path.resolve(file)), { recursive: true });
     await writeFile(tmp, data, { mode });
+    // Restrict before the rename so the final path never exists with inherited permissions.
+    await restrictToOwner(tmp);
     await rename(tmp, file);
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => undefined);
+    if (err instanceof FhirBridgeError) throw err;
     throw new FhirBridgeError('VAULT_IO', 'Could not write the vault file.', { cause: err });
   }
 }
@@ -164,27 +177,43 @@ export function parseVaultFile(text: string): VaultFile {
     f !== null &&
     typeof f === 'object' &&
     f.format === FORMAT &&
-    (f.version === 1 || f.version === 2) &&
+    (f.version === 1 || f.version === 2 || f.version === 3) &&
     (f.kdf === 'scrypt' || f.kdf === 'raw') &&
     typeof f.iv === 'string' &&
     typeof f.tag === 'string' &&
-    typeof f.ciphertext === 'string';
+    typeof f.ciphertext === 'string' &&
+    (f.version !== 3 || (f.kdf === 'scrypt' && typeof f.salt === 'string' && isWrappedKey(f.wrappedKey)));
   if (!ok) throw new FhirBridgeError('VAULT_DECRYPT_FAILED', 'Unrecognised vault file format or version.');
   return f as VaultFile;
 }
 
-function aadFor(header: Pick<VaultFile, 'version' | 'kdf' | 'salt'>): Buffer {
+function aadFor(header: Pick<VaultFile, 'version' | 'kdf' | 'salt' | 'wrappedKey'>): Buffer {
   if (header.version === 1) return Buffer.from(`${FORMAT}:v1`);
-  return Buffer.from(JSON.stringify([FORMAT, header.version, header.kdf, header.salt ?? null]));
+  const fields: unknown[] = [FORMAT, header.version, header.kdf, header.salt ?? null];
+  if (header.version === 3) {
+    const w = header.wrappedKey;
+    fields.push(w ? [w.iv, w.tag, w.ciphertext] : null);
+  }
+  return Buffer.from(JSON.stringify(fields));
+}
+
+/** AAD for wrapping the master key: binds the KEK's salt so a wrapped key cannot be transplanted. */
+function wrapAad(salt: Buffer): Buffer {
+  return Buffer.from(`${FORMAT}:v3:kek:${salt.toString('base64')}`);
 }
 
 export function encryptVault(
   encKey: Buffer,
   plaintext: string,
-  header: { version: VaultVersion; kdf: Kdf; salt?: Buffer },
+  header: { version: VaultVersion; kdf: Kdf; salt?: Buffer; wrappedKey?: WrappedKey },
 ): VaultFile {
   const salt = header.salt?.toString('base64');
-  const meta = { version: header.version, kdf: header.kdf, ...(salt ? { salt } : {}) };
+  const meta = {
+    version: header.version,
+    kdf: header.kdf,
+    ...(salt ? { salt } : {}),
+    ...(header.version === 3 && header.wrappedKey ? { wrappedKey: header.wrappedKey } : {}),
+  };
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', encKey, iv, { authTagLength: 16 });
   cipher.setAAD(aadFor(meta));
@@ -230,11 +259,24 @@ function passphraseKey(passphrase: string, existing: VaultFile | undefined): Res
       `Vault passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`,
     );
   }
-  const salt = existing?.salt ? Buffer.from(existing.salt, 'base64') : randomBytes(16);
+  if (existing?.version === 3 && existing.wrappedKey && existing.salt) {
+    const salt = Buffer.from(existing.salt, 'base64');
+    const kek = scryptSync(passphrase, salt, KEY_BYTES, SCRYPT_V2);
+    const masterKey = unwrapKey(kek, existing.wrappedKey, wrapAad(salt));
+    return { masterKey, kdf: 'scrypt', salt, version: 3, wrappedKey: existing.wrappedKey };
+  }
+  // New vault: random master key. Legacy v1/v2 passphrase vault: the scrypt output IS the master
+  // key; keep it and re-wrap it under a fresh N=2^17 KEK so the next save upgrades the file to v3.
+  const masterKey = existing ? legacyPassphraseKey(passphrase, existing) : newMasterKey();
+  const salt = randomBytes(16);
+  const kek = scryptSync(passphrase, salt, KEY_BYTES, SCRYPT_V2);
+  return { masterKey, kdf: 'scrypt', salt, version: 3, wrappedKey: wrapKey(kek, masterKey, wrapAad(salt)) };
+}
+
+function legacyPassphraseKey(passphrase: string, existing: VaultFile): Buffer {
+  const salt = existing.salt ? Buffer.from(existing.salt, 'base64') : Buffer.alloc(0);
   if (salt.length === 0) throw new FhirBridgeError('VAULT_DECRYPT_FAILED', 'Vault file is missing its KDF salt.');
-  const version: VaultVersion = existing?.version === 1 ? 1 : 2;
-  const params = version === 1 ? SCRYPT_V1 : SCRYPT_V2;
-  return { masterKey: scryptSync(passphrase, salt, KEY_BYTES, params), kdf: 'scrypt', salt, version };
+  return scryptSync(passphrase, salt, KEY_BYTES, existing.version === 1 ? SCRYPT_V1 : SCRYPT_V2);
 }
 
 export async function resolveKey(
@@ -273,7 +315,12 @@ export async function resolveKey(
   try {
     await mkdir(path.dirname(path.resolve(keyFile)), { recursive: true });
     await writeFile(keyFile, masterKey.toString('hex'), { mode: 0o600, flag: 'wx' });
+    await restrictToOwner(keyFile);
   } catch (err) {
+    if (err instanceof FhirBridgeError) {
+      await rm(keyFile, { force: true }).catch(() => undefined);
+      throw err;
+    }
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
       throw new FhirBridgeError('VAULT_IO', 'Could not create the vault key file.', { cause: err });
     }

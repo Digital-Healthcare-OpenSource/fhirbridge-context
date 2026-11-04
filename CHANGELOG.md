@@ -41,6 +41,13 @@ First release.
 
 ### Security
 
+- Vault files and key files are restricted to the current user on Windows too (owner-only ACL
+  with inheritance removed), not only via POSIX `chmod 600`.
+- Passphrase vaults use envelope encryption (v3): a scrypt N=2^17 key-encryption key wraps a random
+  master key. Legacy v1/v2 passphrase vaults are upgraded on save without changing the master key.
+- Container base images pinned by digest.
+- The logger now also redacts identifier-shaped values that look like e-mails, calendar dates or
+  numbers with 7+ digits.
 - Fixed before release, found by a second independent red-team review: PHI passing through
   non-conformant JSON types (numeric identifiers and ZIPs, string `name`/`line`); base64 payloads
   without a content type; the patient's own unlabelled identifiers in notes; uncommon date

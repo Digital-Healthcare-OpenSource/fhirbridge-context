@@ -87,3 +87,12 @@ No network except `pull`; no database; the only persistent state is the encrypte
 ## Log
 - 2026-11-05: audit started. Baseline: 109 tests pass, tsc clean, npm audit 0. Independent
   security review found 3 CRITICAL / 6 HIGH leaks → fixes in progress.
+- 2026-11-05 (round 3, residual backlog from the second red-team review — all [x]):
+  - [x] Windows ACL: vault, temp and key files restricted to the current user (icacls, no shell);
+        fail closed with VAULT_IO — tests/vault-envelope.test.ts checks the real ACL
+  - [x] Vault v3 envelope encryption (scrypt N=2^17 KEK wraps the master key); v1/v2 passphrase
+        vaults upgraded on save with the master key unchanged (shifts/pseudonyms proven stable)
+  - [x] Docker base images pinned by digest (Dependabot docker keeps them current)
+  - [x] Logger redacts e-mail, date and 7+ digit identifier-shaped values
+  - Accepted limits (documented): rollback to an older vault file is undetectable without
+    external state; lowercase un-cued names in free text (use --free-text omit)

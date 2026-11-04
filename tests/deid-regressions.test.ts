@@ -335,7 +335,7 @@ describe('M2/M3/M9 vault file safety', () => {
     await v.save();
     const { readFile, writeFile } = await import('node:fs/promises');
     const parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
-    expect(parsed.version).toBe(2);
+    expect(parsed.version).toBe(3); // passphrase vaults use envelope encryption
     await writeFile(file, JSON.stringify({ ...parsed, salt: Buffer.from('0123456789abcdef').toString('base64') }));
     await expect(SafeHarborVault.open(file, { passphrase: PASS })).rejects.toMatchObject({ code: 'VAULT_DECRYPT_FAILED' });
   });
