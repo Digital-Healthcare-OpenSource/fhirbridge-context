@@ -132,19 +132,20 @@ describe('sentence splitting', () => {
 
 const SHIFT = -142;
 const KEY = 'Patient/pat-1';
-const vault = (window?: { min: string; max: string }) =>
+/** Shifted dates the (fake) de-identifier emitted for the patient. */
+const EMITTED = ['2026-01-15', '2025-08-10', '2025-02-11', '2025-05-09'];
+const vault = (emitted: string[] = EMITTED) =>
   fakeVault({
     tokens: { '[PATIENT_1]': 'John Doe', '[MRN_1]': 'MRN-998877', '[PROVIDER_1]': 'Dr. Smith' },
     shifts: { [KEY]: SHIFT },
-    windows: window ? { [KEY]: window } : {},
+    emitted: { [KEY]: emitted },
   });
-const WINDOW = { min: '2025-01-01', max: '2026-02-01' };
 /** Reverse of the vault's shift (delta -142 means +142 days on rehydration). */
 const back = (d: string): string => shiftFhirDate(d, -SHIFT);
 
 describe('rehydrate', () => {
   it('restores tokens and reverses the date shift', () => {
-    expect(rehydrate('[PATIENT_1] (MRN [MRN_1]) was admitted on 2026-01-15.', vault(WINDOW))).toBe(
+    expect(rehydrate('[PATIENT_1] (MRN [MRN_1]) was admitted on 2026-01-15.', vault())).toBe(
       'John Doe (MRN MRN-998877) was admitted on 2026-06-06.',
     );
   });
@@ -154,47 +155,47 @@ describe('rehydrate', () => {
   });
 
   it('reverses the date part of ISO datetimes and keeps the time', () => {
-    expect(rehydrate('At 2026-01-15T10:00:00Z the line was placed.', vault(WINDOW))).toBe(
+    expect(rehydrate('At 2026-01-15T10:00:00Z the line was placed.', vault())).toBe(
       'At 2026-06-06T10:00:00Z the line was placed.',
     );
   });
 
-  it('leaves dates far outside the shifted window untouched', () => {
-    const text = 'ADA 2019-03-04 guideline; today 2030-01-01; visit 2025-08-10.';
-    expect(rehydrate(text, vault(WINDOW))).toBe(
-      `ADA 2019-03-04 guideline; today 2030-01-01; visit ${back('2025-08-10')}.`,
+  it('reverses only dates the tool emitted; every other date stays as written', () => {
+    const text = 'ADA 2019-03-04 guideline; today 2030-01-01; near miss 2026-01-16; visit 2025-08-10.';
+    expect(rehydrate(text, vault())).toBe(
+      `ADA 2019-03-04 guideline; today 2030-01-01; near miss 2026-01-16; visit ${back('2025-08-10')}.`,
     );
   });
 
-  it('includes dates up to 400 days beyond the window edges', () => {
-    const edge = shiftFhirDate(WINDOW.max, 400);
-    const past = shiftFhirDate(WINDOW.max, 401);
-    expect(rehydrate(`${edge} and ${past}`, vault(WINDOW))).toBe(`${back(edge)} and ${past}`);
-    const low = shiftFhirDate(WINDOW.min, -400);
-    expect(rehydrate(low, vault(WINDOW))).toBe(back(low));
-    expect(rehydrate(shiftFhirDate(WINDOW.min, -401), vault(WINDOW))).toBe(shiftFhirDate(WINDOW.min, -401));
+  it('leaves every date untouched when none was emitted', () => {
+    expect(rehydrate('on 2019-03-04 and 2026-01-15', vault([]))).toBe('on 2019-03-04 and 2026-01-15');
   });
 
-  it('reverses every date when no window was recorded', () => {
-    expect(rehydrate('on 2019-03-04', vault())).toBe(`on ${back('2019-03-04')}`);
-  });
-
-  it('does not touch dates when the patient is ambiguous or unshifted', () => {
-    const two = fakeVault({ shifts: { 'Patient/a': -10, 'Patient/b': -20 } });
-    expect(rehydrate('2026-01-15', two)).toBe('2026-01-15');
+  it('refuses to guess when the vault holds several patients', () => {
+    const two = fakeVault({
+      shifts: { 'Patient/a': -10, 'Patient/b': -20 },
+      emitted: { 'Patient/a': ['2026-01-15'], 'Patient/b': ['2026-01-15'] },
+    });
+    expect(() => rehydrate('2026-01-15', two)).toThrow('Vault holds 2 patients; pass patientKey (--patient Patient/id)');
+    expect(() => new StreamRehydrator(two)).toThrow(/Vault holds 2 patients/);
     expect(rehydrate('2026-01-15', two, { patientKey: 'Patient/b' })).toBe('2026-02-04');
+  });
+
+  it('does not touch dates for an unshifted or unknown patient', () => {
+    expect(rehydrate('2026-01-15', fakeVault())).toBe('2026-01-15');
+    expect(rehydrate('2026-01-15', vault(), { patientKey: 'Patient/other' })).toBe('2026-01-15');
   });
 
   it('ignores impossible calendar dates and does not re-shift restored values', () => {
     expect(rehydrate('2026-13-45', vault())).toBe('2026-13-45');
-    const v = fakeVault({ tokens: { '[ID_1]': '2026-01-15' }, shifts: { [KEY]: SHIFT } });
+    const v = fakeVault({ tokens: { '[ID_1]': '2026-01-15' }, shifts: { [KEY]: SHIFT }, emitted: { [KEY]: ['2026-01-15'] } });
     expect(rehydrate('[ID_1]', v)).toBe('2026-01-15');
   });
 });
 
 /* ------------------------------ streaming ------------------------------ */
 
-function streamAll(chunks: string[], v = vault(WINDOW)): string {
+function streamAll(chunks: string[], v = vault()): string {
   const s = new StreamRehydrator(v);
   return chunks.map((c) => s.push(c)).join('') + s.end();
 }
@@ -224,7 +225,7 @@ function randomSplit(text: string, rand: () => number): string[] {
 describe('StreamRehydrator', () => {
   it('spec: rejoins split tokens and split dates', () => {
     const chunks = ['Patient [PAT', 'IENT_1] was ', 'admitted on 2026-', '01-15.'];
-    const s = new StreamRehydrator(vault(WINDOW));
+    const s = new StreamRehydrator(vault());
     const outputs = chunks.map((c) => s.push(c));
     expect(outputs[0]).toBe('Patient ');
     expect(outputs[1]).toBe('John Doe was ');
@@ -240,21 +241,21 @@ describe('StreamRehydrator', () => {
   ].join('\n');
 
   it('equals rehydrate(full) for every 2-way split', () => {
-    const expected = rehydrate(SAMPLE, vault(WINDOW));
+    const expected = rehydrate(SAMPLE, vault());
     for (let i = 0; i <= SAMPLE.length; i++) {
       expect(streamAll([SAMPLE.slice(0, i), SAMPLE.slice(i)])).toBe(expected);
     }
   });
 
   it('equals rehydrate(full) for every char-by-char and many random chunkings', () => {
-    const expected = rehydrate(SAMPLE, vault(WINDOW));
+    const expected = rehydrate(SAMPLE, vault());
     expect(streamAll([...SAMPLE])).toBe(expected);
     const rand = mulberry32(20261104);
     for (let n = 0; n < 400; n++) expect(streamAll(randomSplit(SAMPLE, rand))).toBe(expected);
   });
 
   it('holds a complete date until the next character shows it is complete', () => {
-    const s = new StreamRehydrator(vault(WINDOW));
+    const s = new StreamRehydrator(vault());
     expect(s.push('on 2026-01-15')).toBe('on ');
     expect(s.push('.')).toBe('2026-06-06.');
     expect(s.end()).toBe('');
@@ -277,11 +278,35 @@ describe('StreamRehydrator', () => {
 describe('verify()', () => {
   it('audits and rehydrates when a vault is given', () => {
     const text = '[PATIENT_1] is currently taking lisinopril [MedicationRequest/medreq-stopped-2] since 2026-01-15.';
-    const result = verify(text, sourceGraph(), vault(WINDOW));
+    const result = verify(text, sourceGraph(), vault());
     expect(result.report.ok).toBe(false);
     expect(result.rehydrated).toBe(
       'John Doe is currently taking lisinopril [MedicationRequest/medreq-stopped-2] since 2026-06-06.',
     );
+  });
+
+  it('maps pseudonymized citation ids back to the original graph via the vault', () => {
+    const mapped = fakeVault({
+      shifts: { [KEY]: SHIFT },
+      originalKeys: {
+        'MedicationRequest/medreq-1a2b3c4d5e': 'MedicationRequest/medreq-stopped-2',
+        'Observation/obs-9f8e7d6c5b': 'Observation/obs-301',
+      },
+    });
+    const text = [
+      'Patient is currently taking lisinopril [MedicationRequest/medreq-1a2b3c4d5e].',
+      'HbA1c is 7.8% [Observation/obs-9f8e7d6c5b].',
+      'See [Observation/obs-nope].',
+    ].join('\n');
+    const withVault = verify(text, sourceGraph(), mapped).report;
+    expect(withVault.issues.map((i) => `${i.code}:${i.citation}`)).toEqual([
+      'CRITICAL_STATUS_CONTRADICTION:MedicationRequest/medreq-1a2b3c4d5e',
+      'HALLUCINATED_RESOURCE_ID:Observation/obs-nope',
+    ]);
+    expect(withVault.citations[1]).toMatchObject({ exists: true, ok: true });
+    // Without the vault the pseudonymized ids cannot be found.
+    const without = auditCitations(text, sourceGraph()).issues.map((i) => i.code);
+    expect(without.filter((c) => c === 'HALLUCINATED_RESOURCE_ID')).toHaveLength(3);
   });
 
   it('skips rehydration without a vault', () => {

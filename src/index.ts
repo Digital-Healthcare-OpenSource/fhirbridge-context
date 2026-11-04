@@ -40,7 +40,11 @@ export interface PackOptions {
 
 export interface PackResult {
   context: CompiledContext;
-  /** Normalized graph BEFORE de-identification (resource ids are identical; audit against it). */
+  /**
+   * Normalized graph BEFORE de-identification. Operator-only: its warnings carry raw values.
+   * Resource ids that embed identifiers are pseudonymized in `deidGraph`; pass the vault to
+   * `verifyResponse` so citations map back to this graph.
+   */
   graph: NormalizedGraph;
   /** De-identified graph, when `deid` was requested. */
   deidGraph?: NormalizedGraph;
@@ -95,8 +99,9 @@ export interface AuditSummary {
 }
 
 /**
- * Integrity + privacy scan. De-identifies with a throwaway in-memory vault only to count
- * identifiers; nothing is persisted.
+ * Integrity + privacy scan for the operator (`warnings` carry raw values; do not forward them to
+ * a model). De-identifies with a throwaway in-memory vault only to count identifiers; nothing is
+ * persisted.
  */
 export function auditInput(input: LoadedInput | InputEntry[], now?: Date): AuditSummary {
   const result = pack(input, { deid: true, now });
@@ -128,7 +133,11 @@ export interface VerifyResponseResult {
   rehydrated?: string;
 }
 
-/** Layer 4: audit an LLM answer against the original graph; rehydrate when a vault is given. */
+/**
+ * Layer 4: audit an LLM answer against the original graph; when a vault is given, pseudonymized
+ * citation ids are mapped back to original ids and the text is rehydrated (reversing only the
+ * dates the tool emitted). A vault with several patients requires `opts.patientKey`.
+ */
 export function verifyResponse(
   text: string,
   graph: NormalizedGraph,
@@ -146,6 +155,6 @@ export { deidentify, scrubText } from './deid/index.js';
 export { classifyStatus, loadInput, normalize, normalizeFile, parseInput } from './normalizer/index.js';
 export { FhirPullError, pullPatient } from './portability/smart-client.js';
 export type { PullOptions, PullResult } from './portability/smart-client.js';
-export { auditCitations, StreamRehydrator } from './verifier/index.js';
+export { auditCitations, extractTokens, StreamRehydrator } from './verifier/index.js';
 export type * from './types/fhir.js';
 export type * from './types/pipeline.js';

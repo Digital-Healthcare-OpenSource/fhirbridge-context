@@ -343,6 +343,6 @@ describe('file loading', () => {
     expect((await loadInput(file)).source).toBe('bundle');
     const empty = await mkdtemp(join(tmpdir(), 'fhirbridge-'));
     dirs.push(empty);
-    await expect(loadInput(empty)).rejects.toThrow(/No \.ndjson/);
+    await expect(loadInput(empty)).rejects.toMatchObject({ code: 'INPUT_INVALID' });
   });
 });

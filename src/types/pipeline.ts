@@ -21,8 +21,11 @@ export interface LoadedInput {
   entries: InputEntry[];
   /** Total raw bytes read from disk (UTF-8). */
   bytes: number;
-  /** Raw input text, used for "before" token estimates. */
-  rawText: string;
+  /**
+   * @deprecated Not retained by the file loader (it doubled peak memory on large Bulk exports).
+   * Token estimates are derived from `bytes`. Still accepted when callers already hold the text.
+   */
+  rawText?: string;
   source: 'bundle' | 'resource-array' | 'single-resource' | 'ndjson-file' | 'ndjson-dir';
 }
 
@@ -166,15 +169,32 @@ export interface VaultReader {
    * LLM writes (guideline years, today's date) are left untouched.
    */
   shiftedDateWindow(patientKey: string): { min: string; max: string } | undefined;
+  /** Keys of every patient that has a date shift in this vault. */
+  patientKeys(): string[];
+  /**
+   * Exact set of SHIFTED calendar dates (YYYY-MM-DD) that de-identification emitted for this
+   * patient. Rehydration reverses only these, so dates the LLM computed or invented are never
+   * silently moved.
+   */
+  emittedShiftedDates(patientKey: string): ReadonlySet<string>;
+  /**
+   * Original `Type/id` for a de-identified resource key whose id was pseudonymized
+   * (ids that embed identifiers). Undefined when the key was not pseudonymized.
+   */
+  originalResourceKey(deidKey: string): string | undefined;
 }
 
+/**
+ * Counts only. Must never carry date offsets, raw values or anything derived from them:
+ * this object is rendered into LLM-facing output.
+ */
 export interface SafeHarborSummary {
   enabled: true;
   /** Replacement counts per token category. */
   replacements: Partial<Record<PhiCategory, number>>;
   datesShifted: number;
-  /** `Patient/id` → day offset. */
-  dateShiftDays: Record<string, number>;
+  /** Number of patients that received a (secret) date shift. */
+  patientsShifted: number;
   /** Patients whose age (> 89) was capped to "90+". */
   agesCapped: number;
   /** ZIP codes in a restricted ZIP3 (< 20,000 population) → "00000". */

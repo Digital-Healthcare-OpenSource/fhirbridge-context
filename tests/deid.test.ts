@@ -175,10 +175,11 @@ describe('vault', () => {
 
     it('uses a key file when no key is supplied and fails with a different master key', async () => {
       const file = path.join(dir, 'v2.json');
-      const v = await SafeHarborVault.open(file, {});
+      const v = await SafeHarborVault.open(file, { allowKeyFile: true });
       const token = v.tokenFor('MRN', 'MRN-1');
       await v.save();
       const again = await SafeHarborVault.open(file, {});
+      await expect(SafeHarborVault.open(path.join(dir, 'nokey.json'))).rejects.toThrow(/No vault key/);
       expect(again.resolveToken(token)).toBe('MRN-1');
       await expect(SafeHarborVault.open(file, { masterKey: randomBytes(32) })).rejects.toThrow(/decryption failed/i);
     });
@@ -236,7 +237,8 @@ describe('deidentify', () => {
   it('shifts every date by the same offset and preserves the 48h interval', () => {
     const vault = SafeHarborVault.create();
     const { graph, summary } = deidentify(basicGraph(), { vault, now: NOW });
-    const days = summary.dateShiftDays['Patient/pat-1'] as number;
+    const days = vault.dateShiftDaysFor('Patient/pat-1') as number;
+    expect(summary.patientsShifted).toBe(1);
     expect(days).toBeGreaterThanOrEqual(-365);
     expect(days).toBeLessThanOrEqual(-2);
 
@@ -295,7 +297,8 @@ describe('deidentify', () => {
     ]);
     const { graph, summary } = deidentify(g, { vault: SafeHarborVault.create(), now: NOW });
     const p = graph.index.get('Patient/old') as Resource;
-    expect(p.birthDate).toBe('1900-01-01');
+    expect(p.birthDate).toBeUndefined();
+    expect(JSON.stringify(p.extension)).toContain('"valueString":"90+"');
     expect((p.address as { postalCode: string }[])[0]?.postalCode).toBe('00000');
     expect(summary.agesCapped).toBe(1);
     expect(summary.zip3Restricted).toBe(1);

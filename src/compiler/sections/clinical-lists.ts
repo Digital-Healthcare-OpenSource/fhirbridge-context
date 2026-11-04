@@ -1,6 +1,7 @@
 import type { Resource } from '../../types/fhir.js';
 import { ageInYears } from '../../shared/fhir-date.js';
 import {
+  ageAtDeidentification,
   anchor,
   capitalize,
   codings,
@@ -15,12 +16,11 @@ import {
   statusOf,
   str,
   systemLabel,
+  visibleBirthDate,
   type Rec,
   type SectionCtx,
 } from './util.js';
 
-/** Age-capped patients carry this sentinel birth date after de-identification. */
-const AGE_CAP_BIRTH_DATE = '1900-01-01';
 const RECENT_LIMIT = 10;
 
 function patientName(patient: Rec): string | undefined {
@@ -30,12 +30,22 @@ function patientName(patient: Rec): string | undefined {
   return str(name.text) ?? str([...given, name.family].filter((p) => typeof p === 'string').join(' '));
 }
 
-function patientAge(patient: Rec, now: Date): string | undefined {
-  const birth = str(patient.birthDate);
-  if (!birth) return undefined;
-  if (birth === AGE_CAP_BIRTH_DATE) return '90+';
-  const age = ageInYears(birth, now);
-  return age === undefined ? undefined : `${age} (DOB: ${birth})`;
+/**
+ * De-identified patients show the recorded age and the birth year only; identified ones keep
+ * `age (DOB: full date)`.
+ */
+function ageAndBirth(patient: Rec, ctx: SectionCtx): [string, string | undefined][] {
+  const recordedAge = ageAtDeidentification(patient);
+  const birth = visibleBirthDate(patient, ctx.deidentified || recordedAge !== undefined);
+  if (ctx.deidentified || recordedAge !== undefined) {
+    return [
+      ['Age', recordedAge],
+      ['Birth year', birth && /^\d{4}$/.test(birth) ? birth : undefined],
+    ];
+  }
+  const full = str(patient.birthDate);
+  const age = full ? ageInYears(full, ctx.now) : undefined;
+  return [['Age', age === undefined ? undefined : `${age} (DOB: ${full})`]];
 }
 
 function patientMrn(patient: Rec): string | undefined {
@@ -44,12 +54,12 @@ function patientMrn(patient: Rec): string | undefined {
   return str((mr ?? ids[0])?.value);
 }
 
-function demographicsLine(patient: Resource, now: Date): string {
+function demographicsLine(patient: Resource, ctx: SectionCtx): string {
   const p = patient as Rec;
   const parts = [
     ['Name', patientName(p)],
     ['Gender', str(p.gender)],
-    ['Age', patientAge(p, now)],
+    ...ageAndBirth(p, ctx),
     ['ZIP', str(recs(p.address)[0]?.postalCode)],
     ['MRN', patientMrn(p)],
   ]
@@ -63,7 +73,7 @@ export function renderDemographics(ctx: SectionCtx): string[] {
   if (patients.length === 0) return [];
   const only = patients.length === 1 ? patients[0] : undefined;
   const heading = `## 1. Patient Demographics${only ? ` ${anchor(only)}` : ''}`;
-  return [heading, '', ...patients.map((p) => demographicsLine(p, ctx.now))];
+  return [heading, '', ...patients.map((p) => demographicsLine(p, ctx))];
 }
 
 function allergyStatus(ctx: SectionCtx, allergy: Resource): string {

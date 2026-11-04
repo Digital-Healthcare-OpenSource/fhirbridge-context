@@ -1,6 +1,6 @@
 import type { Resource } from '../../types/fhir.js';
-import type { IntegrityWarning } from '../../types/pipeline.js';
 import { medInfo } from './medications.js';
+import { safeWarnings, type SafeWarning } from './safe-warnings.js';
 import {
   anchor,
   codings,
@@ -113,27 +113,17 @@ function excludedLines(ctx: SectionCtx): string[] {
   );
 }
 
-function detailString(details: Record<string, unknown> | undefined, ...names: string[]): string | undefined {
-  for (const name of names) {
-    const v = details?.[name];
-    if (typeof v === 'string' && v.trim() !== '') return v.trim();
-    if (typeof v === 'number') return String(v);
-  }
-  return undefined;
-}
-
-function codeWarningLine(w: IntegrityWarning): string {
-  const display = detailString(w.details, 'display', 'medicationDisplay', 'claimedDisplay');
-  const rxcui = detailString(w.details, 'rxcui', 'rxnorm', 'code');
-  const expected = detailString(w.details, 'rxnormName', 'expected', 'expectedDisplay', 'ingredient', 'resolvedName');
+function codeWarningLine(w: SafeWarning): string {
+  const { display, rxcui, expected } = w.details ?? {};
   if (display && rxcui) {
     return `- CODE WARNING: [${w.resourceKey}] display "${display}" conflicts with RxCUI ${rxcui}${expected ? ` ("${expected}")` : ''}.`;
   }
   return `- CODE WARNING: [${w.resourceKey}] ${oneLine(w.message, 240)}`;
 }
 
+/** Section 8 is built from the graph's (sanitized) warnings only; compile the de-identified graph. */
 export function renderWarnings(ctx: SectionCtx): string[] {
-  const mismatches = ctx.graph.warnings
+  const mismatches = safeWarnings(ctx.graph)
     .filter((w) => w.code === 'CODE_DISPLAY_MISMATCH' && inScope(ctx, w.resourceKey))
     .map(codeWarningLine);
   const lines = [...excludedLines(ctx), ...new Set(mismatches)];

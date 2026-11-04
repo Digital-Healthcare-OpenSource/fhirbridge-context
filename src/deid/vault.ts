@@ -1,64 +1,54 @@
 /**
  * SafeHarborVault: reversible pseudonym store.
  *
- * Holds Token <-> raw value mappings and per-patient date shifts, encrypted at rest with
- * AES-256-GCM. Two independent subkeys are derived from one 32-byte master key via
- * HKDF-SHA256: `enc` (file encryption) and `hmac` (date-shift derivation). They are never
- * interchanged.
+ * Holds Token <-> raw value mappings, per-patient date shifts, the exact shifted dates that
+ * were emitted, and pseudonymized resource ids, encrypted at rest with AES-256-GCM. Two
+ * independent subkeys are derived from one 32-byte master key via HKDF-SHA256: `enc` (file
+ * encryption) and `hmac` (date-shift and id derivation). They are never interchanged.
  *
- * PRIVACY: raw values leave this class only through `resolveToken`. Nothing here logs.
+ * PRIVACY: raw values leave this class only through `resolveToken` / `originalResourceKey`.
+ * Nothing here logs.
  *
  * Key resolution for `open()` (first match wins):
  *   1. opts.masterKey
- *   2. opts.passphrase (scrypt, random salt stored in the vault file)
- *   3. env FHIRBRIDGE_VAULT_KEY (64 hex chars)
- *   4. random key file `<path>.key` (mode 0o600). Keep it SEPARATE from the vault file
- *      (different disk / secret store); anyone holding both can decrypt the vault.
+ *   2. opts.passphrase (scrypt, random salt stored in the vault file; min 12 chars)
+ *   3. env FHIRBRIDGE_VAULT_KEY (64 hex chars) / FHIRBRIDGE_VAULT_PASSPHRASE
+ *   4. an EXISTING `<path>.key` file, or a new one when `opts.allowKeyFile` is true. A key file
+ *      beside the vault defeats encryption at rest if both are stolen: opt in knowingly.
+ *
+ * Concurrency: `save()` takes `<path>.lock` and refuses to overwrite a file that another writer
+ * changed since this vault was opened (no silent lost updates).
  */
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHmac,
-  hkdfSync,
-  randomBytes,
-  scryptSync,
-} from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createHmac } from 'node:crypto';
 import path from 'node:path';
+import { FhirBridgeError } from '../errors.js';
 import type { PhiCategory, VaultReader } from '../types/pipeline.js';
+import {
+  assertKeyLength,
+  atomicWrite,
+  decryptVault,
+  deriveVaultSubkeys,
+  encryptVault,
+  newMasterKey,
+  parseVaultFile,
+  readIfExists,
+  resolveKey,
+  withFileLock,
+  type Kdf,
+  type VaultFile,
+  type VaultOpenOptions,
+  type VaultSubkeys,
+  type VaultVersion,
+} from './vault-crypto.js';
+import { NAME_CATEGORIES, canonicalize, canonicalName } from './vault-names.js';
 
-export const VAULT_KEY_ENV = 'FHIRBRIDGE_VAULT_KEY';
-const FORMAT = 'fhirbridge-vault';
-const VERSION = 1;
-const AAD = Buffer.from(`${FORMAT}:v${VERSION}`);
-const HKDF_SALT = Buffer.from('fhirbridge-vault-hkdf-v1');
-const KEY_BYTES = 32;
-const SCRYPT = { N: 32768, r: 8, p: 1, maxmem: 128 * 1024 * 1024 } as const;
+export { VAULT_KEY_ENV, VAULT_PASSPHRASE_ENV, deriveVaultSubkeys } from './vault-crypto.js';
+export type { VaultOpenOptions, VaultSubkeys } from './vault-crypto.js';
+export { canonicalName } from './vault-names.js';
+
 const SHIFT_SPAN = 364;
 const SHIFT_MIN_ABS = 2;
-
-export interface VaultSubkeys {
-  enc: Buffer;
-  hmac: Buffer;
-}
-
-export function deriveVaultSubkeys(masterKey: Buffer): VaultSubkeys {
-  const derive = (info: string): Buffer =>
-    Buffer.from(hkdfSync('sha256', masterKey, HKDF_SALT, Buffer.from(info), KEY_BYTES));
-  return { enc: derive('fhirbridge-vault/enc'), hmac: derive('fhirbridge-vault/hmac') };
-}
-
-type Kdf = 'scrypt' | 'raw';
-
-interface VaultFile {
-  format: typeof FORMAT;
-  version: typeof VERSION;
-  kdf: Kdf;
-  salt?: string;
-  iv: string;
-  tag: string;
-  ciphertext: string;
-}
+const ID_HASH_CHARS = 10;
 
 interface TokenEntry {
   category: PhiCategory;
@@ -72,139 +62,8 @@ interface VaultState {
   index: [string, string][];
   dateShifts: [string, number][];
   windows: [string, { min: string; max: string }][];
-}
-
-export interface VaultOpenOptions {
-  passphrase?: string;
-  masterKey?: Buffer;
-}
-
-const NAME_CATEGORIES: ReadonlySet<PhiCategory> = new Set(['PATIENT', 'PROVIDER', 'PERSON']);
-const TITLE_WORDS = new Set([
-  'mr', 'mrs', 'ms', 'miss', 'mx', 'dr', 'doctor', 'prof', 'professor', 'md', 'do', 'rn', 'np',
-  'pa', 'pac', 'phd', 'dds', 'dmd', 'pharmd', 'mbbs', 'jr', 'sr', 'ii', 'iii', 'iv',
-]);
-const DIGITS_ONLY: ReadonlySet<PhiCategory> = new Set(['PHONE', 'FAX', 'SSN']);
-const ALNUM_ONLY: ReadonlySet<PhiCategory> = new Set([
-  'MRN', 'HEALTH_PLAN', 'ACCOUNT', 'LICENSE', 'VEHICLE', 'DEVICE', 'BIOMETRIC', 'PHOTO', 'ID',
-]);
-
-/** Canonical form of a name: titles/punctuation/initials stripped, "Last, First" flipped, sorted. */
-export function canonicalName(raw: string): string {
-  const folded = raw.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
-  const comma = folded.indexOf(',');
-  const ordered = comma >= 0 ? `${folded.slice(comma + 1)} ${folded.slice(0, comma)}` : folded;
-  const words = ordered
-    .replace(/[^\p{L}\s'-]/gu, ' ')
-    .split(/\s+/)
-    .map((w) => w.replace(/^['-]+|['-]+$/g, ''))
-    .filter((w) => w.length > 1 && !TITLE_WORDS.has(w));
-  return [...new Set(words)].sort().join(' ');
-}
-
-function canonicalize(category: PhiCategory, raw: string): string {
-  const trimmed = raw.trim();
-  let out: string;
-  if (NAME_CATEGORIES.has(category)) out = canonicalName(trimmed);
-  else if (DIGITS_ONLY.has(category)) {
-    out = trimmed.replace(/\D/g, '');
-    if (category !== 'SSN' && out.length === 11 && out.startsWith('1')) out = out.slice(1);
-  } else if (ALNUM_ONLY.has(category)) {
-    out = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '');
-    // "MRN-4471902" (structured) and "4471902" (free text after the label) are the same record number.
-    if (category === 'MRN' && /^mrn\d/.test(out)) out = out.slice(3);
-  }
-  else if (category === 'EMAIL' || category === 'IP') out = trimmed.toLowerCase();
-  else if (category === 'URL') out = trimmed.toLowerCase().replace(/\/+$/, '');
-  else out = trimmed.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-  return out || trimmed.toLowerCase();
-}
-
-function parseHexKey(hex: string, origin: string): Buffer {
-  const clean = hex.trim();
-  if (!/^[0-9a-fA-F]{64}$/.test(clean)) {
-    throw new Error(`${origin} must contain exactly 64 hex characters (32 bytes)`);
-  }
-  return Buffer.from(clean, 'hex');
-}
-
-function assertKeyLength(key: Buffer): Buffer {
-  if (key.length !== KEY_BYTES) throw new Error(`Vault master key must be ${KEY_BYTES} bytes`);
-  return key;
-}
-
-async function readIfExists(file: string): Promise<string | undefined> {
-  try {
-    return await readFile(file, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw err;
-  }
-}
-
-async function atomicWrite(file: string, data: string, mode: number): Promise<void> {
-  await mkdir(path.dirname(path.resolve(file)), { recursive: true });
-  const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  await writeFile(tmp, data, { mode });
-  await rename(tmp, file);
-}
-
-function parseVaultFile(text: string): VaultFile {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error('Vault file is not valid JSON');
-  }
-  const f = parsed as Partial<VaultFile> | null;
-  const ok =
-    f !== null &&
-    typeof f === 'object' &&
-    f.format === FORMAT &&
-    f.version === VERSION &&
-    (f.kdf === 'scrypt' || f.kdf === 'raw') &&
-    typeof f.iv === 'string' &&
-    typeof f.tag === 'string' &&
-    typeof f.ciphertext === 'string';
-  if (!ok) throw new Error('Unrecognised vault file format or version');
-  return f as VaultFile;
-}
-
-interface ResolvedKey {
-  masterKey: Buffer;
-  kdf: Kdf;
-  salt?: Buffer;
-}
-
-async function resolveKey(
-  file: string,
-  existing: VaultFile | undefined,
-  opts: VaultOpenOptions,
-): Promise<ResolvedKey> {
-  if (opts.masterKey) return { masterKey: assertKeyLength(opts.masterKey), kdf: 'raw' };
-  if (opts.passphrase !== undefined) {
-    if (opts.passphrase.length === 0) throw new Error('Vault passphrase must not be empty');
-    if (existing && existing.kdf !== 'scrypt') {
-      throw new Error('Vault was not created with a passphrase');
-    }
-    const salt = existing?.salt ? Buffer.from(existing.salt, 'base64') : randomBytes(16);
-    if (salt.length === 0) throw new Error('Vault file is missing its KDF salt');
-    return { masterKey: scryptSync(opts.passphrase, salt, KEY_BYTES, SCRYPT), kdf: 'scrypt', salt };
-  }
-  if (existing?.kdf === 'scrypt') throw new Error('Vault is passphrase-protected: passphrase required');
-  const env = process.env[VAULT_KEY_ENV];
-  if (env) return { masterKey: parseHexKey(env, VAULT_KEY_ENV), kdf: 'raw' };
-  const keyFile = `${file}.key`;
-  const stored = await readIfExists(keyFile);
-  if (stored !== undefined) return { masterKey: parseHexKey(stored, keyFile), kdf: 'raw' };
-  if (existing) {
-    throw new Error(
-      `Vault key not found: pass a passphrase/masterKey, set ${VAULT_KEY_ENV}, or restore ${keyFile}`,
-    );
-  }
-  const masterKey = randomBytes(KEY_BYTES);
-  await atomicWrite(keyFile, masterKey.toString('hex'), 0o600);
-  return { masterKey, kdf: 'raw' };
+  emitted?: [string, string[]][];
+  ids?: [string, string][];
 }
 
 export class SafeHarborVault implements VaultReader {
@@ -212,12 +71,16 @@ export class SafeHarborVault implements VaultReader {
   private readonly counters = new Map<string, number>();
   private readonly entries = new Map<string, TokenEntry>();
   private readonly index = new Map<string, string>();
-  private readonly nameIndex = new Map<string, { words: Set<string>; token: string }[]>();
   private readonly shifts = new Map<string, number>();
   private readonly windows = new Map<string, { min: string; max: string }>();
+  private readonly emitted = new Map<string, Set<string>>();
+  private readonly ids = new Map<string, string>();
   private filePath?: string;
   private kdf: Kdf = 'raw';
   private salt?: Buffer;
+  private version: VaultVersion = 2;
+  /** Path + GCM tag of the file state this vault was loaded from / last saved as. */
+  private baseline?: { file: string; tag: string | undefined };
 
   private constructor(masterKey: Buffer) {
     this.keys = deriveVaultSubkeys(masterKey);
@@ -229,7 +92,7 @@ export class SafeHarborVault implements VaultReader {
   }
 
   static create(opts: { masterKey?: Buffer } = {}): SafeHarborVault {
-    return new SafeHarborVault(assertKeyLength(opts.masterKey ?? randomBytes(KEY_BYTES)));
+    return new SafeHarborVault(assertKeyLength(opts.masterKey ?? newMasterKey()));
   }
 
   static async open(file: string, opts: VaultOpenOptions = {}): Promise<SafeHarborVault> {
@@ -240,6 +103,8 @@ export class SafeHarborVault implements VaultReader {
     vault.filePath = file;
     vault.kdf = resolved.kdf;
     vault.salt = resolved.salt;
+    vault.version = resolved.version;
+    vault.baseline = { file: path.resolve(file), tag: existing?.tag };
     if (existing) vault.load(existing);
     return vault;
   }
@@ -248,42 +113,34 @@ export class SafeHarborVault implements VaultReader {
 
   async save(file?: string): Promise<void> {
     const target = file ?? this.filePath;
-    if (!target) throw new Error('Vault has no path: pass one to save()');
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.keys.enc, iv, { authTagLength: 16 });
-    cipher.setAAD(AAD);
-    const ciphertext = Buffer.concat([cipher.update(JSON.stringify(this.toState()), 'utf8'), cipher.final()]);
-    const out: VaultFile = {
-      format: FORMAT,
-      version: VERSION,
-      kdf: this.kdf,
-      ...(this.salt ? { salt: this.salt.toString('base64') } : {}),
-      iv: iv.toString('base64'),
-      tag: cipher.getAuthTag().toString('base64'),
-      ciphertext: ciphertext.toString('base64'),
-    };
-    await atomicWrite(target, JSON.stringify(out, null, 2), 0o600);
+    if (!target) throw new FhirBridgeError('USAGE', 'Vault has no path: pass one to save().');
+    const resolved = path.resolve(target);
+    await withFileLock(target, async () => {
+      const current = await readIfExists(target);
+      if (current !== undefined) {
+        const onDisk = parseVaultFile(current);
+        const known = this.baseline?.file === resolved ? this.baseline.tag : undefined;
+        if (known === undefined || onDisk.tag !== known) {
+          throw new FhirBridgeError(
+            'VAULT_CONFLICT',
+            'Vault changed concurrently: another process saved it since it was opened.',
+            { hint: 'Rerun the command.' },
+          );
+        }
+      }
+      const out = encryptVault(this.keys.enc, JSON.stringify(this.toState()), {
+        version: this.version,
+        kdf: this.kdf,
+        salt: this.salt,
+      });
+      await atomicWrite(target, JSON.stringify(out, null, 2), 0o600);
+      this.baseline = { file: resolved, tag: out.tag };
+    });
     this.filePath ??= target;
   }
 
   private load(file: VaultFile): void {
-    let plain: string;
-    try {
-      const decipher = createDecipheriv('aes-256-gcm', this.keys.enc, Buffer.from(file.iv, 'base64'), {
-        authTagLength: 16,
-      });
-      decipher.setAAD(AAD);
-      decipher.setAuthTag(Buffer.from(file.tag, 'base64'));
-      plain = Buffer.concat([
-        decipher.update(Buffer.from(file.ciphertext, 'base64')),
-        decipher.final(),
-      ]).toString('utf8');
-    } catch {
-      throw new Error(
-        'Vault decryption failed: wrong key or passphrase, or the vault file was modified',
-      );
-    }
-    this.fromState(JSON.parse(plain) as VaultState);
+    this.fromState(JSON.parse(decryptVault(this.keys.enc, file)) as VaultState);
   }
 
   private toState(): VaultState {
@@ -293,35 +150,35 @@ export class SafeHarborVault implements VaultReader {
       index: [...this.index],
       dateShifts: [...this.shifts],
       windows: [...this.windows],
+      emitted: [...this.emitted].map(([k, v]) => [k, [...v].sort()]),
+      ids: [...this.ids],
     };
   }
 
   private fromState(state: VaultState): void {
     for (const [k, v] of Object.entries(state.counters)) this.counters.set(k, v);
     for (const [token, entry] of state.tokens) this.entries.set(token, entry);
-    for (const [key, token] of state.index) {
-      this.index.set(key, token);
-      const entry = this.entries.get(token);
-      if (entry && NAME_CATEGORIES.has(entry.category)) this.addNameIndex(key, token);
-    }
+    for (const [key, token] of state.index) this.index.set(key, token);
     for (const [k, v] of state.dateShifts) this.shifts.set(k, v);
     for (const [k, v] of state.windows) this.windows.set(k, v);
+    for (const [k, v] of state.emitted ?? []) this.emitted.set(k, new Set(v));
+    for (const [k, v] of state.ids ?? []) this.ids.set(k, v);
   }
 
   /* -------------------------------- tokens --------------------------------- */
 
-  tokenFor(category: PhiCategory, raw: string, opts: { patientKey?: string } = {}): string {
+  tokenFor(category: PhiCategory, raw: string, opts: { patientKey?: string; ambiguous?: boolean } = {}): string {
     const canon = canonicalize(category, raw);
-    const scope = category === 'PATIENT' ? (opts.patientKey ?? '') : '';
+    // Ambiguous bare names get their own token space so they never resolve to one person.
+    const scope = opts.ambiguous ? 'ambiguous' : category === 'PATIENT' ? (opts.patientKey ?? '') : '';
     const key = this.indexKey(category, scope, canon);
-    const found = this.index.get(key) ?? this.findNameMatch(category, scope, canon);
+    const found = this.index.get(key);
     if (found) {
-      this.bind(category, key, found);
       this.upgradeRaw(found, raw, canon);
       return found;
     }
     const token = this.issue(category, raw, canon);
-    this.bind(category, key, token);
+    this.index.set(key, token);
     return token;
   }
 
@@ -338,8 +195,10 @@ export class SafeHarborVault implements VaultReader {
     const scope = category === 'PATIENT' ? (opts.patientKey ?? '') : '';
     for (const variant of rest) {
       const canon = canonicalize(category, variant);
+      // A bare first/last name is shared by many people: never bind it to this token.
+      if (!canon.includes(' ')) continue;
       const key = this.indexKey(category, scope, canon);
-      if (!this.index.has(key)) this.bind(category, key, token);
+      if (!this.index.has(key)) this.index.set(key, token);
       this.upgradeRaw(token, variant, canon);
     }
     return token;
@@ -367,32 +226,6 @@ export class SafeHarborVault implements VaultReader {
       nameWords: NAME_CATEGORIES.has(category) ? canon.split(' ').length : 0,
     });
     return token;
-  }
-
-  private bind(category: PhiCategory, key: string, token: string): void {
-    if (!this.index.has(key)) this.index.set(key, token);
-    if (NAME_CATEGORIES.has(category)) this.addNameIndex(key, token);
-  }
-
-  private addNameIndex(key: string, token: string): void {
-    const [category = '', scope = '', ...canon] = key.split('|');
-    const bucket = `${category}|${scope}`;
-    const list = this.nameIndex.get(bucket) ?? [];
-    list.push({ words: new Set(canon.join('|').split(' ')), token });
-    this.nameIndex.set(bucket, list);
-  }
-
-  /** Same person spelled with extra/missing middle names: >=2 shared words and one is a subset. */
-  private findNameMatch(category: PhiCategory, scope: string, canon: string): string | undefined {
-    if (!NAME_CATEGORIES.has(category)) return undefined;
-    const words = canon.split(' ');
-    if (words.length < 2) return undefined;
-    for (const cand of this.nameIndex.get(`${category}|${scope}`) ?? []) {
-      if (cand.words.size < 2) continue;
-      const shared = words.filter((w) => cand.words.has(w)).length;
-      if (shared >= 2 && (shared === words.length || shared === cand.words.size)) return cand.token;
-    }
-    return undefined;
   }
 
   private upgradeRaw(token: string, raw: string, canon: string): void {
@@ -426,10 +259,17 @@ export class SafeHarborVault implements VaultReader {
     return new Map(this.shifts);
   }
 
-  /** Track the window of shifted calendar dates emitted for a patient (first 10 chars, YYYY-MM-DD). */
+  patientKeys(): string[] {
+    return [...this.shifts.keys()];
+  }
+
+  /** Record a SHIFTED date emitted for a patient (first 10 chars, YYYY-MM-DD). */
   recordShiftedDate(patientKey: string, isoDate: string): void {
     const day = isoDate.slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+    const set = this.emitted.get(patientKey) ?? new Set<string>();
+    set.add(day);
+    this.emitted.set(patientKey, set);
     const w = this.windows.get(patientKey);
     if (!w) this.windows.set(patientKey, { min: day, max: day });
     else this.windows.set(patientKey, { min: day < w.min ? day : w.min, max: day > w.max ? day : w.max });
@@ -438,5 +278,26 @@ export class SafeHarborVault implements VaultReader {
   shiftedDateWindow(patientKey: string): { min: string; max: string } | undefined {
     const w = this.windows.get(patientKey);
     return w ? { ...w } : undefined;
+  }
+
+  emittedShiftedDates(patientKey: string): ReadonlySet<string> {
+    return new Set(this.emitted.get(patientKey) ?? []);
+  }
+
+  /* ------------------------------ resource ids ------------------------------ */
+
+  /** Stable pseudonymous id for an identifying `Type/id`; the mapping is kept for rehydration. */
+  pseudonymizeResourceId(resourceType: string, id: string): string {
+    const digest = createHmac('sha256', this.keys.hmac)
+      .update(`RESOURCE_ID:${resourceType}/${id}`)
+      .digest('hex')
+      .slice(0, ID_HASH_CHARS);
+    const pseudonym = `${resourceType.toLowerCase()}-${digest}`;
+    this.ids.set(`${resourceType}/${pseudonym}`, `${resourceType}/${id}`);
+    return pseudonym;
+  }
+
+  originalResourceKey(deidKey: string): string | undefined {
+    return this.ids.get(deidKey);
   }
 }

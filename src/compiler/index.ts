@@ -1,6 +1,7 @@
 import type { Resource } from '../types/fhir.js';
 import type { CompileOptions, CompiledContext, NormalizedGraph } from '../types/pipeline.js';
 import { compileClinicalMarkdown } from './narrative-compiler.js';
+import { AGE_EXTENSION_URL } from './sections/util.js';
 import { buildTokenReport } from './token-estimator.js';
 import { compileViews, toCsv } from './view-definition.js';
 
@@ -16,6 +17,12 @@ function slim(value: unknown): unknown {
   if (typeof value !== 'object' || value === null) return value;
   const out: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
+    if (key === 'extension' && Array.isArray(child)) {
+      // The recorded age is the only clinical signal left for age-capped patients.
+      const ages = child.filter((e: unknown) => (e as { url?: unknown } | null)?.url === AGE_EXTENSION_URL);
+      if (ages.length > 0) out[key] = ages;
+      continue;
+    }
     if (NOISE_KEYS.has(key)) continue;
     if (key === 'text' && typeof child === 'object' && child !== null && 'div' in child) continue;
     out[key] = slim(child);

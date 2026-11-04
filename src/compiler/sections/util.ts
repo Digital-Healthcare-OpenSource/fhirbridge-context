@@ -10,7 +10,12 @@ export interface SectionCtx {
   /** Restrict output to this `Patient/id` (undefined = whole graph). */
   patientKey?: string;
   now: Date;
+  /** The graph was de-identified: a full birth date must never be rendered. */
+  deidentified?: boolean;
 }
+
+/** Extension the de-identifier sets on Patient: `valueString` is an age (`'64'`) or `'90+'`. */
+export const AGE_EXTENSION_URL = 'https://fhirbridge.dev/fhir/StructureDefinition/age-at-deidentification';
 
 export function rec(value: unknown): Rec | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -66,6 +71,23 @@ export function conceptText(concept: unknown): string | undefined {
 export function firstConceptText(value: unknown): string | undefined {
   if (Array.isArray(value)) return value.map(conceptText).find((t) => t !== undefined);
   return conceptText(value);
+}
+
+/** Age recorded by de-identification (`'64'` or `'90+'`), if present. */
+export function ageAtDeidentification(patient: Rec): string | undefined {
+  const ext = recs(patient.extension).find((e) => e.url === AGE_EXTENSION_URL);
+  return str(ext?.valueString);
+}
+
+/**
+ * Birth date as it may be shown: the 4-digit year when de-identified (anything longer is cut to
+ * the year, defensively), the full value otherwise.
+ */
+export function visibleBirthDate(patient: Rec, deidentified: boolean | undefined): string | undefined {
+  const birth = str(patient.birthDate);
+  if (!birth) return undefined;
+  if (!deidentified) return birth;
+  return /^\d{4}/.test(birth) ? birth.slice(0, 4) : undefined;
 }
 
 export function keyOf(resource: Resource): string {

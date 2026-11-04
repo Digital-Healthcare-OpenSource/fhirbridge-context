@@ -8,13 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macOS is added back when the repository is public (private macOS minutes are metered 10x).
+        os: [ubuntu-latest, windows-latest]
         node: [22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -26,12 +32,74 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+      - run: npm run test:e2e
       - name: CLI smoke test
         shell: bash
+        env:
+          FHIRBRIDGE_VAULT_PASSPHRASE: ci-only-passphrase-not-secret
         run: |
           node dist/cli.js --version
-          node dist/cli.js pack tests/fixtures/synthea-messy-patient.json --deid > ctx.md
-          grep -q "SafeHarbor: ENABLED" ctx.md
+          node dist/cli.js pack tests/fixtures/synthea-messy-patient.json > ctx.md
           ! grep -q "Gonzalez" ctx.md
-      - name: Benchmark (fails if planted PHI leaks)
+          ! grep -qi "DateShift" ctx.md
+          set +e
+          printf 'Patient is currently taking Lisinopril daily [MedicationRequest/medreq-088].' > answer.txt
+          node dist/cli.js verify answer.txt --bundle tests/fixtures/synthea-messy-patient.json
+          test $? -eq 1
+      - name: Benchmark (fails if planted PHI or the date offset leaks)
         run: npm run bench
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Published files contain no fixtures, vaults or keys
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e "
+            const files = require('./pack.json')[0].files.map(f => f.path);
+            const bad = files.filter(p => !/^(dist\/|README\.md$|LICENSE$|package\.json$)/.test(p) || /vault|\.key$|fixtures/.test(p));
+            if (bad.length) { console.error('unexpected files in package:', bad); process.exit(1); }
+            console.log(files.length + ' files OK');
+          "
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: fhirbridge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run as non-root on a read-only root filesystem
+        run: |
+          test "$(docker image inspect fhirbridge:ci --format '{{.Config.User}}')" = "nonroot"
+          docker run --rm --read-only -v "$PWD/tests/fixtures:/data:ro" fhirbridge:ci pack /data/synthea-messy-patient.json > ctx.md
+          grep -q "De-identified: YES" ctx.md
+          ! grep -q "Gonzalez" ctx.md

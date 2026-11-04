@@ -49,6 +49,12 @@ for (let i = 0; i < 15; i++) {
 
 const out = result.context.content;
 const leaked = PLANTED_PHI.filter((v) => out.includes(v));
+// The per-patient date offset must never reach the context: with it, shifted dates are reversible.
+const offsets = [...result.vault.dateShifts().values()].map((days) => Math.abs(days));
+const offsetLeaks = [
+  ...(/DateShift/i.test(out) ? ['DateShift'] : []),
+  ...offsets.filter((n) => new RegExp(`(?<![\\d.-])-?${n}\\s*d\\b`).test(out)).map((n) => `${n}d`),
+];
 const kept = PROTECTED_TERMS.filter((v) => out.includes(v));
 const audit = auditInput(loaded);
 
@@ -85,10 +91,11 @@ const rows = [
     'Planted PHI strings leaked into context',
     `${leaked.length} / ${PLANTED_PHI.length}${leaked.length ? ` (${leaked.join(', ')})` : ''}`,
   ],
+  ['Date-shift offset leaked into context (DateShift label or offset value)', `${offsetLeaks.length}${offsetLeaks.length ? ` (${offsetLeaks.join(', ')})` : ''}`],
   ['Clinical terms preserved', `${kept.length} / ${PROTECTED_TERMS.length}`],
   ['entered-in-error excluded / code conflicts flagged', `${audit.enteredInError} / ${audit.codeWarnings}`],
 ];
 
 process.stdout.write(`| Metric | Value |\n| :--- | :--- |\n${rows.map(([k, v]) => `| ${k} | ${v} |`).join('\n')}\n`);
 process.stdout.write(`\nNode ${process.version}, ${process.platform}/${process.arch}\n`);
-if (leaked.length > 0) process.exitCode = 1;
+if (leaked.length > 0 || offsetLeaks.length > 0) process.exitCode = 1;

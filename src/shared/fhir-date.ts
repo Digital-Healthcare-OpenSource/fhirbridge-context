@@ -1,8 +1,9 @@
 /**
  * FHIR date/dateTime shifting that preserves precision, time of day and timezone.
  *
- * Used by de-identification (shift by Δt) and rehydration (shift by −Δt), so both
- * directions are exact inverses.
+ * Used by de-identification (shift by Δt) and rehydration (shift by −Δt). For day precision and
+ * finer the two directions are exact inverses (property-tested). Only real calendar dates parse:
+ * `2021-13` or `2021-02-30` are not dates, so callers treat them as unparseable (fail closed).
  */
 
 const MS_PER_DAY = 86_400_000;
@@ -22,14 +23,33 @@ export interface ParsedFhirDate {
   timePart: string;
 }
 
+const inRange = (v: string | undefined, min: number, max: number): boolean =>
+  v === undefined || (Number(v) >= min && Number(v) <= max);
+
+/** Real calendar day (rejects 2021-02-30, 2023-02-29, …). */
+function isCalendarDay(year: number, month: number, day: number): boolean {
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
+function validZone(zone: string | undefined): boolean {
+  if (zone === undefined || zone === 'Z') return true;
+  const [h, m] = zone.slice(1).split(':');
+  return inRange(h, 0, 14) && inRange(m, 0, 59);
+}
+
 export function parseFhirDate(value: string): ParsedFhirDate | undefined {
   const trimmed = value.trim();
   const m = FHIR_DATE_RE.exec(trimmed);
   if (!m) return undefined;
-  const [, y, mo, d] = m;
+  const [, y, mo, d, hh, mi, ss, , zone] = m;
+  const year = Number(y);
+  if (!inRange(mo, 1, 12) || !inRange(hh, 0, 23) || !inRange(mi, 0, 59) || !inRange(ss, 0, 60)) return undefined;
+  if (d !== undefined && !isCalendarDay(year, Number(mo), Number(d))) return undefined;
+  if (!validZone(zone)) return undefined;
   const datePartLength = 4 + (mo ? 3 : 0) + (d ? 3 : 0);
   return {
-    year: Number(y),
+    year,
     month: mo ? Number(mo) : undefined,
     day: d ? Number(d) : undefined,
     timePart: trimmed.slice(datePartLength),
@@ -37,7 +57,7 @@ export function parseFhirDate(value: string): ParsedFhirDate | undefined {
 }
 
 export function isFhirDate(value: string): boolean {
-  return FHIR_DATE_RE.test(value.trim());
+  return parseFhirDate(value) !== undefined;
 }
 
 function pad(n: number, width = 2): string {
@@ -49,14 +69,17 @@ function pad(n: number, width = 2): string {
  *
  * - `YYYY-MM-DD[Thh:mm[:ss[.sss]][tz]]`: the calendar date moves; time and zone are untouched,
  *   so the interval between two shifted instants is preserved to the second.
- * - `YYYY-MM` / `YYYY`: shifted from the first day of the period, then truncated back to the
- *   original precision.
- * Returns the input unchanged if it is not a FHIR date.
+ * - `YYYY-MM`: shifted from the middle of the month (the 15th) and truncated back, so a shift
+ *   moves the month by the nearest amount instead of always rounding down. Lossy by nature.
+ * - `YYYY`: returned unchanged. A year is permitted under Safe Harbor, and shifting from Jan 1
+ *   would push every year-only value into the previous year.
+ * Returns the input unchanged if it is not a valid FHIR date.
  */
 export function shiftFhirDate(value: string, days: number): string {
   const parsed = parseFhirDate(value);
   if (!parsed) return value;
-  const base = Date.UTC(parsed.year, (parsed.month ?? 1) - 1, parsed.day ?? 1);
+  if (parsed.month === undefined) return value;
+  const base = Date.UTC(parsed.year, parsed.month - 1, parsed.day ?? 15);
   const shifted = new Date(base + days * MS_PER_DAY);
   const y = pad(shifted.getUTCFullYear(), 4);
   if (parsed.month === undefined) return y;

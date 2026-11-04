@@ -8,26 +8,62 @@
  *   FHIRBRIDGE_VAULT_PASSPHRASE, FHIRBRIDGE_VAULT_KEY, FHIRBRIDGE_TOKEN
  */
 import { readFile, writeFile } from 'node:fs/promises';
-import { Command, InvalidArgumentError, Option } from 'commander';
+import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
+import { loadRuntimeConfig, type LogFormat } from './config.js';
+import { describeCauses, FhirBridgeError, toFhirBridgeError } from './errors.js';
 import { auditInput, pack, VERSION, type PackResult } from './index.js';
+import { createLogger, type Logger } from './logger.js';
 import { SafeHarborVault } from './deid/index.js';
+import { runDoctor } from './doctor.js';
 import { loadInput, normalize } from './normalizer/index.js';
 import { pullPatient } from './portability/smart-client.js';
 import type { ContextFormat, IntegrityWarning, LoadedInput } from './types/pipeline.js';
-import { rehydrate, verify } from './verifier/index.js';
+import { auditCitations, rehydrate } from './verifier/index.js';
 
 const FORMATS: ContextFormat[] = ['clinical-md', 'view-json', 'csv', 'fhir-slim'];
 
+const NO_DEID_WARNING = [
+  '!! WARNING: de-identification is OFF (--no-deid).',
+  '!! The output contains real patient identifiers and dates. Do NOT send it to an external LLM or share it.',
+];
+const VERIFY_VAULT_HINT =
+  'If this context was de-identified, pass --vault so pseudonymized ids can be mapped back.';
+const ALLOW_KEY_FILE_HELP =
+  'allow a key file next to the vault when no FHIRBRIDGE_VAULT_PASSPHRASE / FHIRBRIDGE_VAULT_KEY is set (weaker: the key sits beside the data)';
+
 function err(line = ''): void {
   process.stderr.write(`${line}\n`);
+}
+
+/** Process-wide logger, configured from env and the global --log-format / --verbose / --quiet flags. */
+let log: Logger = createLogger({ level: 'silent' });
+let logFormat: LogFormat = 'text';
+
+interface GlobalOptions {
+  debug?: boolean;
+  logFormat?: LogFormat;
+  verbose?: boolean;
+  quiet?: boolean;
+}
+
+function configureLogging(opts: GlobalOptions): void {
+  const cfg = loadRuntimeConfig();
+  logFormat = opts.logFormat ?? cfg.logFormat;
+  const level = opts.quiet ? 'error' : opts.verbose || opts.debug ? 'debug' : cfg.logLevel;
+  log = createLogger({ format: logFormat, level });
 }
 
 function passphrase(): string | undefined {
   return process.env.FHIRBRIDGE_VAULT_PASSPHRASE || undefined;
 }
 
-async function openVault(path: string | undefined): Promise<SafeHarborVault | undefined> {
-  return path ? SafeHarborVault.open(path, { passphrase: passphrase() }) : undefined;
+async function openVault(
+  path: string | undefined,
+  allowKeyFile: boolean | undefined,
+): Promise<SafeHarborVault | undefined> {
+  return path
+    ? SafeHarborVault.open(path, { passphrase: passphrase(), allowKeyFile: allowKeyFile === true })
+    : undefined;
 }
 
 async function emit(content: string, out?: string): Promise<void> {
@@ -35,9 +71,26 @@ async function emit(content: string, out?: string): Promise<void> {
   else process.stdout.write(content.endsWith('\n') ? content : `${content}\n`);
 }
 
-function printPackStats(result: PackResult, vaultPath?: string): void {
+function printPackStats(result: PackResult, vaultPath: string | undefined, ms: number): void {
   const t = result.context.tokens;
   const codeWarnings = result.graph.warnings.filter((w) => w.code === 'CODE_DISPLAY_MISMATCH').length;
+  // JSON logs carry the stats; in text mode the box below is the human view (event only with -v).
+  (logFormat === 'json' ? log.info : log.debug)('pack.done', {
+    resources: result.graph.resources.length,
+    tokensIn: t.inputTokens,
+    tokensOut: t.outputTokens,
+    reductionPct: t.reductionPct,
+    excluded: result.graph.excluded.length,
+    codeWarnings,
+    deidentified: result.safeHarbor !== undefined,
+    identifiers: result.safeHarbor
+      ? Object.values(result.safeHarbor.replacements).reduce<number>((a, n) => a + (n ?? 0), 0)
+      : 0,
+    datesShifted: result.safeHarbor?.datesShifted ?? 0,
+    vaultPersisted: vaultPath !== undefined,
+    ms,
+  });
+  if (logFormat === 'json') return;
   err('┌ FHIRBridge pack');
   err(`│ Resources:        ${result.graph.resources.length}`);
   err(
@@ -49,13 +102,13 @@ function printPackStats(result: PackResult, vaultPath?: string): void {
   if (result.safeHarbor) {
     const s = result.safeHarbor;
     const replaced = Object.values(s.replacements).reduce<number>((a, n) => a + (n ?? 0), 0);
-    err(`│ Safe Harbor:      ENABLED — ${replaced} identifiers tokenized, ${s.datesShifted} dates shifted`);
+    err(`│ De-identified:    YES — ${replaced} identifiers tokenized, ${s.datesShifted} dates shifted`);
     err(
       `│                   ZIP3 restricted ${s.zip3Restricted}, generalized ${s.zip3Generalized}; ages capped ${s.agesCapped}`,
     );
     err(`│ Vault:            ${vaultPath ?? 'in-memory (not saved: rehydration will not be possible)'}`);
   } else {
-    err('│ Safe Harbor:      DISABLED (add --deid before sending to an external LLM)');
+    err('│ De-identified:    NO (--no-deid): output holds real identifiers; do not send it to an external LLM');
   }
   err('└');
 }
@@ -74,35 +127,53 @@ function formatOption(): Option {
 }
 
 interface PackCliOptions {
+  /** `--no-deid` sets this to false; anything else means de-identify (the default). */
   deid?: boolean;
   vault?: string;
+  allowKeyFile?: boolean;
   format: ContextFormat;
   output?: string;
   patient?: string;
 }
 
 async function packAndEmit(loaded: LoadedInput, opts: PackCliOptions): Promise<void> {
-  const vault = opts.deid ? await openVault(opts.vault) : undefined;
-  const result = pack(loaded, { deid: opts.deid, vault, format: opts.format, patientKey: opts.patient });
-  if (opts.deid && opts.vault && result.vault) await result.vault.save(opts.vault);
+  const deid = opts.deid !== false;
+  if (!deid) {
+    // Before anything is written, so it cannot scroll past unnoticed.
+    for (const line of NO_DEID_WARNING) err(line);
+    if (opts.vault) err('!! --vault is ignored with --no-deid.');
+  }
+  const start = performance.now();
+  const vault = deid ? await openVault(opts.vault, opts.allowKeyFile) : undefined;
+  const result = pack(loaded, { deid, vault, format: opts.format, patientKey: opts.patient });
+  if (deid && opts.vault && result.vault) await result.vault.save(opts.vault);
   await emit(result.context.content, opts.output);
-  printPackStats(result, opts.deid ? opts.vault : undefined);
+  printPackStats(result, deid ? opts.vault : undefined, Math.round(performance.now() - start));
 }
 
 function warningLine(w: IntegrityWarning): string {
   return `  ${w.code.padEnd(28)} ${w.resourceKey}  ${w.message}`;
 }
 
-async function runVerify(
-  file: string,
-  opts: { bundle: string; vault?: string; rehydrate?: boolean; json?: boolean },
-): Promise<void> {
+interface VerifyCliOptions {
+  bundle: string;
+  vault?: string;
+  allowKeyFile?: boolean;
+  patient?: string;
+  rehydrate?: boolean;
+  json?: boolean;
+}
+
+async function runVerify(file: string, opts: VerifyCliOptions): Promise<void> {
   const text = await readFile(file, 'utf8');
   const loaded = await loadInput(opts.bundle);
   const graph = normalize(loaded.entries, { rawText: loaded.rawText, inputBytes: loaded.bytes });
-  const vault = opts.rehydrate ? await openVault(opts.vault) : undefined;
-  if (opts.rehydrate && !vault) throw new Error('--rehydrate requires --vault');
-  const { report, rehydrated } = verify(text, graph, vault);
+  const vault = await openVault(opts.vault, opts.allowKeyFile);
+  if (opts.rehydrate && !vault) throw new FhirBridgeError('USAGE', '--rehydrate requires --vault.');
+  // With a vault, pseudonymized ids the model cites are mapped back to the bundle's own ids.
+  const report = auditCitations(text, graph, vault);
+  const rehydrated = opts.rehydrate && vault ? rehydrate(text, vault, { patientKey: opts.patient }) : undefined;
+  const missingAnchor = report.issues.some((i) => i.code === 'HALLUCINATED_RESOURCE_ID');
   if (opts.json) {
     process.stdout.write(`${JSON.stringify({ report, rehydrated }, null, 2)}\n`);
   } else {
@@ -111,6 +182,13 @@ async function runVerify(
     for (const i of report.issues) err(`  [${i.severity.toUpperCase()}] ${i.code} ${i.citation}: ${i.message}`);
     err(report.ok ? '✔ No critical clinical contradictions.' : '✖ Critical issues found.');
   }
+  if (missingAnchor && !vault) err(VERIFY_VAULT_HINT);
+  (logFormat === 'json' ? log.info : log.debug)('verify.done', {
+    citations: report.citations.length,
+    issues: report.issues.length,
+    critical: report.issues.filter((i) => i.severity === 'critical').length,
+    ok: report.ok,
+  });
   process.exitCode = report.ok ? 0 : 1;
 }
 
@@ -140,12 +218,26 @@ async function runAudit(input: string, opts: { json?: boolean }): Promise<void> 
   );
 }
 
+/** De-identification is the default; this stays accepted (hidden) so existing scripts keep working. */
+function deidOption(): Option {
+  return new Option('--deid', 'de-identify the output (default)').hideHelp();
+}
+
+function noDeidOption(): Option {
+  return new Option(
+    '--no-deid',
+    'DISABLE de-identification: output keeps real names, identifiers and dates (never send it to an external LLM)',
+  );
+}
+
 function addPackCommands(program: Command): void {
   program
     .command('pack')
     .argument('<input>', 'FHIR Bundle (.json), resource array, .ndjson file, or Bulk $export directory')
-    .option('--deid', 'apply HIPAA Safe Harbor de-identification')
+    .addOption(deidOption())
+    .addOption(noDeidOption())
     .option('--vault <path>', 'encrypted vault for reversible tokens/date shifts (created if missing)')
+    .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
     .option('--patient <key>', 'only compile this patient (Patient/id)')
     .addOption(formatOption())
     .option('-o, --output <path>', 'write context to a file instead of stdout')
@@ -157,9 +249,11 @@ function addPackCommands(program: Command): void {
     .requiredOption('--iss <url>', 'FHIR R4 base URL (SMART iss)')
     .requiredOption('--patient <id>', 'patient id')
     .option('--token <token>', 'bearer token (prefer the FHIRBRIDGE_TOKEN env var)')
-    .option('--deid', 'apply HIPAA Safe Harbor de-identification')
+    .addOption(deidOption())
+    .addOption(noDeidOption())
     .option('--vault <path>', 'encrypted vault file')
-    .option('--max-pages <n>', 'pagination limit', (v) => Number.parseInt(v, 10), 200)
+    .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
+    .option('--max-pages <n>', 'pagination limit per resource type', (v) => Number.parseInt(v, 10), 200)
     .addOption(formatOption())
     .option('-o, --output <path>', 'write context to a file instead of stdout')
     .description('pull Patient/$everything (or the patient compartment) and pack it')
@@ -171,6 +265,9 @@ function addPackCommands(program: Command): void {
         maxPages: opts.maxPages,
       });
       err(`Pulled ${pulled.entries.length} resources via ${pulled.method} (${pulled.pages} page(s)).`);
+      for (const s of pulled.skipped) {
+        err(`WARNING: skipped ${s.type} (HTTP ${s.status}): the server did not serve it, so this record may be incomplete.`);
+      }
       await packAndEmit(pulled, { ...opts, patient: undefined });
     });
 }
@@ -180,8 +277,10 @@ function addAuditCommands(program: Command): void {
     .command('verify')
     .argument('<llm-response-file>', 'text produced by the LLM')
     .requiredOption('--bundle <path>', 'the original FHIR input the context was compiled from')
-    .option('--vault <path>', 'vault used during pack (needed for --rehydrate)')
-    .option('--rehydrate', 'restore real names, identifiers and dates in the output')
+    .option('--vault <path>', 'vault used during pack (maps pseudonymized ids back; needed for --rehydrate)')
+    .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
+    .option('--patient <key>', 'Patient/id whose date shift to reverse (required if the vault holds several patients)')
+    .option('--rehydrate', 'restore real names, identifiers and the dates the tool shifted in the output')
     .option('--json', 'print the audit report as JSON')
     .description('audit [ResourceType/id] citations; exit code 1 on critical findings')
     .action(runVerify);
@@ -197,11 +296,12 @@ function addAuditCommands(program: Command): void {
     .command('rehydrate')
     .argument('<file>', 'LLM output containing tokens like [PATIENT_1] and shifted dates')
     .requiredOption('--vault <path>', 'vault used during pack')
-    .option('--patient <key>', 'Patient/id whose date shift to reverse (default: the only patient)')
-    .description('restore real identifiers and dates in LLM output')
-    .action(async (file: string, opts: { vault: string; patient?: string }) => {
-      const vault = await openVault(opts.vault);
-      if (!vault) throw new Error('--vault is required');
+    .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
+    .option('--patient <key>', 'Patient/id whose date shift to reverse (required if the vault holds several patients)')
+    .description('restore real identifiers and the dates the tool shifted in LLM output')
+    .action(async (file: string, opts: { vault: string; patient?: string; allowKeyFile?: boolean }) => {
+      const vault = await openVault(opts.vault, opts.allowKeyFile);
+      if (!vault) throw new FhirBridgeError('USAGE', '--vault is required.');
       const text = await readFile(file, 'utf8');
       process.stdout.write(`${rehydrate(text, vault, { patientKey: opts.patient })}\n`);
     });
@@ -210,32 +310,71 @@ function addAuditCommands(program: Command): void {
     .command('mcp')
     .requiredOption('--bundle <path>', 'FHIR input to serve (de-identified)')
     .option('--vault <path>', 'encrypted vault file (keeps tokens stable across restarts)')
-    .option('--allow-rehydrate', 'let verify_and_rehydrate_clinical_draft return real PHI (local models only)')
+    .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
+    .option(
+      '--allow-rehydrate',
+      'returns REAL PHI to the model — only for models running locally (only tokens the server has shown)',
+    )
     .description('start a privacy-by-design MCP server on stdio')
-    .action(async (opts: { bundle: string; vault?: string; allowRehydrate?: boolean }) => {
+    .action(async (opts: { bundle: string; vault?: string; allowKeyFile?: boolean; allowRehydrate?: boolean }) => {
       // Loaded lazily: the MCP SDK is the heaviest dependency and only this command needs it.
       const { runMcpServer } = await import('./mcp/server.js');
       await runMcpServer({
         bundlePath: opts.bundle,
         vaultPath: opts.vault,
         passphrase: passphrase(),
+        allowKeyFile: opts.allowKeyFile === true,
         allowRehydrate: opts.allowRehydrate === true,
+        logger: log,
       });
     });
+}
+
+function parseLogFormat(value: string): LogFormat {
+  if (value !== 'text' && value !== 'json') throw new InvalidArgumentError('Expected text or json');
+  return value;
 }
 
 export function buildProgram(): Command {
   const program = new Command('fhirbridge')
     .version(VERSION)
-    .description('Normalize messy FHIR R4 exports, de-identify them reversibly, and compile verified LLM context.');
+    .description('Normalize messy FHIR R4 exports, de-identify them reversibly, and compile verified LLM context.')
+    .option('--debug', 'print error causes and stack traces (may include input data; do not share)')
+    .addOption(new Option('--log-format <format>', 'diagnostics format on stderr (text | json)').argParser(parseLogFormat))
+    .option('-v, --verbose', 'more diagnostics (per-stage timings)')
+    .option('-q, --quiet', 'only errors on stderr')
+    .exitOverride()
+    .hook('preAction', (cmd) => configureLogging(cmd.optsWithGlobals<GlobalOptions>()));
   addPackCommands(program);
   addAuditCommands(program);
+  program
+    .command('doctor')
+    .description('check Node version, configuration and vault key setup (prints no secret values)')
+    .action(async () => {
+      const report = await runDoctor();
+      for (const check of report.checks) err(`${check.ok ? '✔' : '✖'} ${check.name}: ${check.detail}`);
+      process.exitCode = report.ok ? 0 : 78;
+    });
   return program;
+}
+
+/** Single error boundary: classify, print a PHI-free message (+ hint), set a sysexits code. */
+function handleFailure(error: unknown, debug: boolean): void {
+  if (error instanceof CommanderError) {
+    // Commander already printed usage/help/version; 0 for --help and --version.
+    process.exitCode = error.exitCode === 0 ? 0 : 64;
+    return;
+  }
+  const mapped = toFhirBridgeError(error);
+  err(`fhirbridge: ${mapped.message}`);
+  if (mapped.hint) err(`  hint: ${mapped.hint}`);
+  if (debug) for (const line of describeCauses(mapped)) err(`  ${line}`);
+  log.error('command.failed', { code: mapped.code, exitCode: mapped.exitCode });
+  process.exitCode = mapped.exitCode;
 }
 
 try {
   await buildProgram().parseAsync(process.argv);
 } catch (e) {
-  err(`fhirbridge: ${e instanceof Error ? e.message : String(e)}`);
-  process.exitCode = 2;
+  handleFailure(e, process.argv.includes('--debug'));
 }

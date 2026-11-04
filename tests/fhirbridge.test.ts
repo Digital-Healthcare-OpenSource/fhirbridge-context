@@ -14,6 +14,7 @@ import {
   SafeHarborVault,
   scrubText,
   StreamRehydrator,
+  verifyResponse,
 } from '../src/index.js';
 import { shiftFhirDate } from '../src/shared/fhir-date.js';
 import type { Encounter, InputEntry, Observation, Resource } from '../src/index.js';
@@ -94,6 +95,10 @@ describe('FHIRBridge end-to-end', () => {
 
     const llm = `Admitted ${enc.period.start.slice(0, 10)}; troponin drawn ${obs.effectiveDateTime.slice(0, 10)}.`;
     expect(rehydrate(llm, vault)).toBe('Admitted 2026-05-10; troponin drawn 2026-05-12.');
+    // Dates the model computed or quoted (never emitted by the tool) are left exactly as written.
+    expect(rehydrate('ADA guideline 2019-03-04; follow-up on 2030-01-01.', vault)).toBe(
+      'ADA guideline 2019-03-04; follow-up on 2030-01-01.',
+    );
   });
 
   it('test_eponym_and_clinical_fraction_protection', () => {
@@ -183,6 +188,36 @@ describe('FHIRBridge end-to-end', () => {
 
     expect(output).toBe(`Patient ${vault.resolveToken('[PATIENT_1]')} was admitted on ${realAdmission}.`);
     expect(output).not.toContain('[PAT');
+  });
+
+  it('test_deidentified_output_never_carries_offsets_or_planted_identifiers', async () => {
+    for (const format of ['clinical-md', 'view-json', 'csv', 'fhir-slim'] as const) {
+      const { context, safeHarbor } = await packFile(FIXTURE, { deid: true, now: NOW, format });
+      expect(context.content, format).not.toMatch(/DateShift/i);
+      expect(context.content, format).not.toContain('Gonzalez');
+      expect(context.content, format).not.toContain('1962-03-14');
+      expect(JSON.stringify(safeHarbor), format).not.toMatch(/dateShift/i);
+    }
+  });
+
+  it('test_rehydration_requires_a_patient_when_the_vault_holds_several', () => {
+    const vault = SafeHarborVault.create({ masterKey: MASTER_KEY });
+    pack(entries(patient('p1'), patient('p2')), { deid: true, vault, now: NOW });
+    expect(() => rehydrate('on 2026-01-15', vault)).toThrow(/Vault holds 2 patients; pass patientKey/);
+    expect(() => rehydrate('on 2026-01-15', vault, { patientKey: 'Patient/p1' })).not.toThrow();
+  });
+
+  it('test_verify_maps_pseudonymized_citation_ids_back_with_the_vault', async () => {
+    const vault = SafeHarborVault.create({ masterKey: MASTER_KEY });
+    const { graph, deidGraph } = pack(await loadInput(FIXTURE), { deid: true, vault, now: NOW });
+    const citations = (deidGraph?.resources ?? []).slice(0, 25).map((r) => `[${r.resourceType}/${r.id}]`);
+    const answer = `Records reviewed ${citations.join(' ')}.`;
+    for (const c of citations) {
+      const key = c.slice(1, -1);
+      expect(graph.index.has(vault.originalResourceKey(key) ?? key), key).toBe(true);
+    }
+    const { report } = verifyResponse(answer, graph, vault, { patientKey: 'Patient/pat-1' });
+    expect(report.issues.filter((i) => i.code === 'HALLUCINATED_RESOURCE_ID')).toEqual([]);
   });
 
   it('loads the fixture as a Bundle with every trap present', async () => {

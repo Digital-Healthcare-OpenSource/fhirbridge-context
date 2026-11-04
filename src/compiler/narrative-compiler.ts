@@ -23,14 +23,9 @@ export function selectedPatientKey(graph: NormalizedGraph, requested?: string): 
     .sort()[0];
 }
 
-function headerLine(graph: NormalizedGraph, opts: CompileOptions, version: string): string {
-  const parts = [`FHIRBridge v${version}`, `SafeHarbor: ${opts.safeHarbor ? 'ENABLED' : 'DISABLED'}`];
-  if (opts.safeHarbor) {
-    const key = selectedPatientKey(graph, opts.patientKey);
-    const shift = key ? opts.safeHarbor.dateShiftDays[key] : undefined;
-    if (shift !== undefined) parts.push(`DateShift: ${shift}d`);
-  }
-  return `# CLINICAL SUMMARY CONTEXT (${parts.join(' | ')})`;
+function headerLine(opts: CompileOptions, version: string): string {
+  // Never render date offsets: with the offset and the shifted dates the real dates are recoverable.
+  return `# CLINICAL SUMMARY CONTEXT (FHIRBridge v${version} | De-identified: ${opts.safeHarbor ? 'YES' : 'NO'})`;
 }
 
 /**
@@ -42,7 +37,12 @@ export function compileClinicalMarkdown(
   graph: NormalizedGraph,
   opts: CompileOptions & { version?: string },
 ): string {
-  const ctx: SectionCtx = { graph, patientKey: opts.patientKey, now: opts.now ?? new Date() };
+  const ctx: SectionCtx = {
+    graph,
+    patientKey: opts.patientKey,
+    now: opts.now ?? new Date(),
+    deidentified: opts.safeHarbor !== undefined,
+  };
   const sections = [
     renderDemographics(ctx),
     renderAllergies(ctx),
@@ -55,6 +55,6 @@ export function compileClinicalMarkdown(
     renderNotes(ctx),
     renderWarnings(ctx),
   ].filter((lines) => lines.length > 0);
-  const header = headerLine(graph, opts, opts.version ?? DEFAULT_COMPILER_VERSION);
+  const header = headerLine(opts,opts.version ?? DEFAULT_COMPILER_VERSION);
   return `${[header, ...sections.map((lines) => lines.join('\n'))].join('\n\n')}\n`;
 }

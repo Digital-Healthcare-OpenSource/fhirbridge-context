@@ -13,13 +13,14 @@
 </p>
 
 ```bash
-npx fhirbridge pack patient-export.json --deid --vault patient.vault.json > context.md
+export FHIRBRIDGE_VAULT_PASSPHRASE='use-a-long-passphrase'
+npx fhirbridge pack patient-export.json --vault patient.vault.json > context.md   # de-identified by default
 ```
 
 FHIRBridge is a zero-config **CLI, SDK and MCP server** that sits between messy EHR FHIR R4 exports and an LLM:
 
 1. **Normalize**: resolves references (`Type/id`, `urn:uuid:`, `#contained`), decodes Base64 notes, strips XHTML narrative, repairs over-long ids and missing timestamps, and lints RxNorm codes.
-2. **De-identify reversibly**: HIPAA Safe Harbor tokenization plus a per-patient date shift that keeps every interval intact, stored in an AES-256-GCM vault.
+2. **De-identify reversibly**: removes or tokenizes the 18 HIPAA identifier categories, reduces the date of birth to a year, and shifts every other date by a secret per-patient offset that keeps intervals intact. Token mappings live in an AES-256-GCM vault. This is **not** strict Safe Harbor; see [Privacy model and limits](#privacy-model-and-limits).
 3. **Compile**: dense clinical Markdown (or SQL-on-FHIR-style tables) where every fact ends with a `[ResourceType/id]` anchor.
 4. **Verify**: checks the model's answer against the record, catching invented ids, stopped drugs described as current, and wrong lab values. It then restores the real names and dates locally.
 
@@ -48,10 +49,10 @@ Token counts are estimates at 4 bytes per token, applied the same way to input a
 ## What you get
 
 ```markdown
-# CLINICAL SUMMARY CONTEXT (FHIRBridge v0.1.0 | SafeHarbor: ENABLED | DateShift: -361d)
+# CLINICAL SUMMARY CONTEXT (FHIRBridge v0.1.0 | De-identified: YES)
 
 ## 1. Patient Demographics [Patient/pat-1]
-- Name: [PATIENT_1] | Gender: female | Age: 65 (DOB: 1961-03-18) | ZIP: 021XX | MRN: [MRN_1] [Patient/pat-1]
+- Name: [PATIENT_1] | Gender: female | Age: 64 | Birth year: 1962 | ZIP: 021XX | MRN: [MRN_1] [Patient/pat-1]
 
 ## 4. Active Medications (Deduplicated by RxNorm)
 - Metformin 500 MG Oral Tablet [RxNorm: 861007] — 1 tablet twice daily with meals (Authored: 2024-08-16, Status: active, Refills consolidated: 50) [MedicationRequest/medreq-104]
@@ -74,7 +75,7 @@ Token counts are estimates at 4 bytes per token, applied the same way to input a
 Ask the model to cite the anchors. Then check its answer:
 
 ```bash
-$ fhirbridge verify answer.txt --bundle patient-export.json
+$ fhirbridge verify answer.txt --bundle patient-export.json --vault patient.vault.json
 Citations checked: 3; issues: 2
   [CRITICAL] CRITICAL_STATUS_CONTRADICTION MedicationRequest/medreq-088: … historical in the source record but the sentence presents it as current.
   [CRITICAL] HALLUCINATED_RESOURCE_ID Observation/obs-k-1: … does not exist in the source record.
@@ -90,7 +91,7 @@ Feeding raw FHIR to an LLM goes wrong in predictable ways:
 
 - **Bloat.** Most of an export is structural JSON, repeated XHTML narrative and Base64 attachments. Long records overflow context windows or get silently truncated by local runtimes.
 - **Broken graphs.** Medication names hide behind `medicationReference`, labs hang off panels, and bulk exports carry ids over FHIR's 64-character limit or no `meta.lastUpdated`. Some datasets carry RxNorm codes that do not match their display text.
-- **De-identification that breaks the timeline.** Shifting each resource's dates independently destroys the intervals clinicians reason about, such as days since admission or time between labs. FHIRBridge derives one offset per patient (HMAC of the patient id) and applies it to every date in that patient's graph, including `contained`, extensions and free text. Time of day is preserved, so a 41 h 45 min gap stays 41 h 45 min.
+- **De-identification that breaks the timeline.** Shifting each resource's dates independently destroys the intervals clinicians reason about, such as days since admission or time between labs. FHIRBridge derives one secret offset per patient (HMAC of the patient id) and applies it to every date in that patient's graph, including `contained`, extensions and free text. Time of day is preserved, so a 41 h 45 min gap stays 41 h 45 min. The offset itself is never written to any output.
 - **Naive scrubbers damage the medicine.** Eponyms (`Foley`, `Swan-Ganz`, `Parkinson's`, `Hodgkin`) get redacted as names, and clinical fractions (`2/12 cores`, `4/5` strength, `PEEP 10/5`) get rewritten as dates. FHIRBridge masks those patterns before it detects identifiers.
 - **Status hallucination.** Summaries merge `stopped` and `entered-in-error` orders into the active medication list. FHIRBridge gates status at compile time and audits it again in the answer.
 
@@ -109,14 +110,18 @@ Requires Node.js ≥ 22.12.
 
 | Command | What it does |
 | :--- | :--- |
-| `fhirbridge pack <input> [--deid] [--vault <file>] [-f clinical-md\|view-json\|csv\|fhir-slim] [--patient Patient/id] [-o out]` | Layers 1→3. Context goes to stdout and statistics to stderr. |
-| `fhirbridge verify <answer.txt> --bundle <input> [--vault <file> --rehydrate] [--json]` | Layer 4 citation audit. Exits 1 on critical findings. |
-| `fhirbridge rehydrate <answer.txt> --vault <file> [--patient Patient/id]` | Restores tokens and reverses the date shift. |
-| `fhirbridge audit <input> [--json]` | Resource counts, token savings, PHI found, `entered-in-error` records and code conflicts. |
-| `fhirbridge pull --iss <fhir-base> --patient <id> [--deid] [--vault <file>]` | Pulls `Patient/$everything` (falling back to a compartment search) from any FHIR R4 server, then packs. |
+| `fhirbridge pack <input> [--no-deid] [--vault <file>] [-f clinical-md\|view-json\|csv\|fhir-slim] [--patient Patient/id] [-o out]` | Layers 1→3. **De-identifies by default.** Context goes to stdout and statistics to stderr. Without `--vault` an in-memory vault is used and rehydration is impossible. |
+| `fhirbridge verify <answer.txt> --bundle <input> [--vault <file>] [--rehydrate] [--patient Patient/id] [--json]` | Layer 4 citation audit. With `--vault`, pseudonymized ids the model cites are mapped back to the bundle's ids. Exits 1 on critical findings. |
+| `fhirbridge rehydrate <answer.txt> --vault <file> [--patient Patient/id]` | Restores tokens and reverses the dates the tool shifted. A vault with several patients requires `--patient`. |
+| `fhirbridge audit <input> [--json]` | Resource counts, token savings, PHI found, `entered-in-error` records and code conflicts. Operator-only: its warnings can contain raw values. |
+| `fhirbridge pull --iss <fhir-base> --patient <id> [--no-deid] [--vault <file>]` | Pulls `Patient/$everything` (falling back to a compartment search) from any FHIR R4 server, then packs. De-identifies by default. |
 | `fhirbridge mcp --bundle <input> [--vault <file>] [--allow-rehydrate]` | Starts the MCP server on stdio. |
 
+`--no-deid` (on `pack` and `pull`) switches de-identification off, prints a warning on stderr before anything is written, and produces output with real names, identifiers and dates. Never send that output to an external LLM.
+
 `<input>` can be a Bundle, a JSON array of resources, a single resource, an `.ndjson` file, or a Bulk `$export` directory of `.ndjson` files.
+
+`pull` falls back to a compartment search when `$everything` is unsupported. In that search only HTTP 400/404/405 for a resource type are skipped, and each skipped type is reported as a warning; 401/403/408/429/5xx abort the pull instead of returning a partial record. Requests time out after 60 s, a single page is capped at 50 MB, and `--max-pages` applies per resource type.
 
 Secrets come from the environment only, never from argv:
 
@@ -126,7 +131,7 @@ Secrets come from the environment only, never from argv:
 | `FHIRBRIDGE_VAULT_KEY` | 64 hex chars; used instead of a passphrase |
 | `FHIRBRIDGE_TOKEN` | Bearer token for `pull` |
 
-Without either variable, a random key is written next to the vault as `<vault>.key` with mode 0600. Keep it somewhere else in production.
+A vault key is required: set one of the first two variables. FHIRBridge does not silently create a key file. If you accept the weaker setup where the key sits beside the data, pass `--allow-key-file` explicitly.
 
 ## MCP: Claude Desktop, Cursor, OpenCode
 
@@ -147,9 +152,9 @@ Without either variable, a random key is written next to the vault as `<vault>.k
 | `get_patient_clinical_summary` | The de-identified `clinical-md` context (or `view-json` / `csv`) |
 | `query_patient_resources` | De-identified resources filtered by type, code, shifted date range and status. `entered-in-error` records are never returned. |
 | `verify_and_rehydrate_clinical_draft` | A citation audit of the agent's draft |
-| `audit_bundle_integrity` | EHR data-quality warnings, Safe Harbor counts and token statistics |
+| `audit_bundle_integrity` | EHR data-quality warnings (code, resource key, sanitized message), de-identification counts and token statistics |
 
-Tool results are model input, so the MCP server **never returns real PHI by default**. Rehydrate on your side with `fhirbridge rehydrate`, or start the server with `--allow-rehydrate` only when the model runs locally.
+Tool results are model input, so the MCP server **never returns real PHI unless started with `--allow-rehydrate`**. Every tool reads the de-identified graph only. Rehydrate on your side with `fhirbridge rehydrate`; use `--allow-rehydrate` only when the model runs locally. Even then, only tokens the server itself has shown to the model are restored.
 
 ## SDK
 
@@ -158,9 +163,10 @@ import { packFile, verifyResponse, SafeHarborVault, StreamRehydrator } from 'fhi
 
 const vault = await SafeHarborVault.open('patient.vault.json', { passphrase: process.env.VAULT_PASS });
 const { context, graph } = await packFile('patient-export.json', { deid: true, vault });
-await vault.save();
+await vault.save('patient.vault.json');
 
 const answer = await llm(context.content);                  // your model call
+// The vault maps pseudonymized ids back to `graph`; pass { patientKey } if it holds several patients.
 const { report, rehydrated } = verifyResponse(answer, graph, vault);
 if (!report.ok) throw new Error(report.issues.map((i) => i.code).join(', '));
 
@@ -182,7 +188,7 @@ Each layer is also published on its own: `fhirbridge/normalizer`, `fhirbridge/de
    │                                    │  status gate · RxNorm brand→ingredient · code/display lint
    └─────────────────┬──────────────────┘
    ┌─────────────────▼──────────────────┐
-   │ 2  Safe Harbor engine + vault      │  tokens [PATIENT_1] [MRN_1] … · per-patient Δt ∈ [−365, −2]
+   │ 2  De-identification + vault       │  tokens [PATIENT_1] [MRN_1] … · per-patient Δt ∈ [−365, −2]
    │    (AES-256-GCM, HKDF subkeys)     │  eponym/fraction guards · ZIP3 · age > 89 → 90+
    └─────────────────┬──────────────────┘
    ┌─────────────────▼──────────────────┐
@@ -199,10 +205,13 @@ Each layer is also published on its own: `fhirbridge/normalizer`, `fhirbridge/de
 
 Read this before using it with real patient data.
 
-- **Safe Harbor coverage.** Structured fields are handled for all 18 identifier categories. Biometrics and photos are handled by removing attachment payloads, because they cannot be detected in text. Free-text detection uses dictionaries, known names and cue words (`Pt`, `Dr.`, `signed by`, …). A bare name with no cue that does not also appear in a structured field can be missed. This is a strong default, not a certification. Have your privacy officer validate it, or use Expert Determination, before sending data to a third party.
-- **The vault contains PHI** (encrypted). Anyone holding the vault and its key can reverse the tokens. Keep the key off the machine that talks to the LLM.
-- **Rehydration is window-limited.** It only reverses dates that fall near the patient's shifted timeline, so dates the model invents, such as guideline years, are left alone.
-- **Resource ids are not tokenized.** Ids longer than 64 characters are shortened. If your EHR embeds MRNs in short ids, remap them first.
+- **This is not strict HIPAA Safe Harbor.** Safe Harbor requires removing all elements of dates except the year. FHIRBridge removes or tokenizes the 18 identifier categories and reduces the date of birth to the year (ages over 89 become `90+`), but by default it **shifts** all other dates by a secret per-patient offset instead of removing them. Date shifting is a technique used under Expert Determination, not under Safe Harbor, and it keeps day-level information that Safe Harbor would remove. Treat the output as de-identified for LLM use under your own risk assessment, not as a Safe Harbor determination, and have your privacy officer or an expert validate it before data leaves your control.
+- **De-identification is the default and can be turned off.** `pack` and `pull` de-identify unless you pass `--no-deid`, which prints a warning and outputs real identifiers and dates.
+- **Free-text detection is heuristic.** Structured fields are handled for all 18 identifier categories, and biometrics and photos are handled by removing attachment payloads. In free text, names are found through dictionaries, names registered from structured fields, and cue words (`Pt`, `Dr.`, `signed by`, relationship words such as `mother` or `husband`, and CJK, Vietnamese and Korean honorific cues). A name with no cue that is not registered from a structured field can be missed. Validate the output on a sample of your own notes before relying on it.
+- **The vault contains PHI** (encrypted). Anyone holding the vault and its key can reverse the tokens. The key must come from the environment (`FHIRBRIDGE_VAULT_PASSPHRASE` or `FHIRBRIDGE_VAULT_KEY`); a key file next to the vault is used only with `--allow-key-file`. Keep the key off the machine that talks to the LLM.
+- **Rehydration reverses only dates the tool emitted.** The vault records the exact shifted dates it produced for each patient. Any other date, such as a guideline year or a date the model computed, is left exactly as written. A vault that holds several patients requires you to name one (`--patient Patient/id`).
+- **The MCP server never returns real PHI unless started with `--allow-rehydrate`**, and then only for tokens it has already shown to the model. Use that flag only with models that run locally.
+- **Resource ids that embed identifiers are pseudonymized.** Ids longer than 64 characters are shortened. Pass the vault to `verify` / `verifyResponse` so the ids a model cites map back to your bundle.
 - **The RxNorm dictionary is small.** It covers common outpatient drugs and known bad codes. It is not a terminology server.
 - **This is not a medical device.** The verifier reduces some failure modes; it does not make model output clinically safe.
 
