@@ -7,12 +7,16 @@
  * Plain ids like `pat-1`, `obs-301` stay untouched.
  */
 import type { Resource } from '../types/fhir.js';
-import { collectNameVariants } from './name-collect.js';
+import { collectIdentifierTerms } from './identifier-collect.js';
+import { collectNameVariants, collectNestedNames } from './name-collect.js';
 import { STOP_WORDS } from './scrub-name-patterns.js';
 import type { SafeHarborVault } from './vault.js';
 
-const DIGIT_RUN = /\d{5,}/;
+/** 4+ consecutive digits can be a date (YYYYMMDD), a phone, an MRN: such ids are pseudonymized. */
+const DIGIT_RUN = /\d{4,}/;
 const SSN_SHAPE = /\d{3}-\d{2}-\d{4}/;
+const SHORT_DATE_SHAPE = /\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}/;
+const PHONE_SHAPE = /\d{3}[-.\s]\d{3}[-.\s]\d{4}/;
 const LABEL_SHAPE = /(?:^|[^a-z])(?:mrn|ssn)(?:[^a-z]|$)/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REFERENCE_TAIL = /^(.*?)([A-Z][A-Za-z]+)\/([^/?#]+)((?:\/_history\/[^/]+)?)$/;
@@ -37,21 +41,42 @@ export interface KeyMapper {
   mapIdMap(idMap: ReadonlyMap<string, string>): Map<string, string>;
 }
 
+function addNameParts(names: Set<string>, variants: readonly string[]): void {
+  for (const v of variants) {
+    for (const part of v.split(/[\s,]+/)) {
+      const p = part.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '').toLowerCase();
+      if (p.length >= MIN_NAME_PART && !STOP_WORDS.has(p)) names.add(p);
+      for (const piece of p.split('-')) {
+        if (piece.length >= MIN_NAME_PART && !STOP_WORDS.has(piece)) names.add(piece);
+      }
+    }
+  }
+}
+
+/** Display text of references that point at a person ("Practitioner/jsmith-md" + "J Smith"). */
+function personDisplays(resource: Resource): string[] {
+  const out: string[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 64) return;
+    if (Array.isArray(value)) return value.forEach((v) => visit(v, depth + 1));
+    if (!isObj(value)) return;
+    const type = typeof value.reference === 'string' ? REFERENCE_TAIL.exec(value.reference)?.[2] : value.type;
+    if (typeof value.display === 'string' && typeof type === 'string' && PERSON_TYPES.has(type)) out.push(value.display);
+    for (const v of Object.values(value)) visit(v, depth + 1);
+  };
+  visit(resource, 0);
+  return out;
+}
+
 function collectSensitive(resources: readonly Resource[]): { names: string[]; identifiers: string[] } {
   const names = new Set<string>();
   const identifiers = new Set<string>();
   for (const r of resources) {
-    if (PERSON_TYPES.has(r.resourceType)) {
-      for (const v of collectNameVariants(r.name as never)) {
-        for (const part of v.split(/[\s,]+/)) {
-          const p = part.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '').toLowerCase();
-          if (p.length >= MIN_NAME_PART && !STOP_WORDS.has(p)) names.add(p);
-        }
-      }
-    }
-    const ids = Array.isArray(r.identifier) ? r.identifier : [];
-    for (const i of ids) {
-      const value = isObj(i) && typeof i.value === 'string' ? alnum(i.value) : '';
+    if (PERSON_TYPES.has(r.resourceType)) addNameParts(names, collectNameVariants(r.name));
+    for (const group of collectNestedNames(r)) addNameParts(names, group);
+    addNameParts(names, personDisplays(r));
+    for (const term of collectIdentifierTerms(r)) {
+      const value = alnum(term.value);
       if (value.length >= MIN_IDENTIFIER_ALNUM && (value.match(/\d/g)?.length ?? 0) >= 3) identifiers.add(value);
     }
   }
@@ -63,7 +88,9 @@ export function createKeyMapper(resources: readonly Resource[], vault: SafeHarbo
   const idCache = new Map<string, string>();
 
   const isIdentifying = (id: string): boolean => {
-    if (!UUID.test(id) && (DIGIT_RUN.test(id) || SSN_SHAPE.test(id))) return true;
+    if (!UUID.test(id) && (DIGIT_RUN.test(id) || SSN_SHAPE.test(id) || SHORT_DATE_SHAPE.test(id) || PHONE_SHAPE.test(id))) {
+      return true;
+    }
     if (LABEL_SHAPE.test(id)) return true;
     const lower = id.toLowerCase();
     if (sensitive.names.some((n) => lower.includes(n))) return true;
@@ -91,15 +118,34 @@ export function createKeyMapper(resources: readonly Resource[], vault: SafeHarbo
     return `${prefix}${type}/${mapId(type, id)}${history}`;
   };
 
-  const rewrite = (value: unknown, key: string | undefined): unknown => {
-    if (typeof value === 'string') return key === 'reference' ? mapReference(value) : value;
-    if (Array.isArray(value)) return value.map((v) => rewrite(v, key));
+  /** Contained resources are local to one resource: an identifying local id is renamed with its `#refs`. */
+  const containedRenames = (resource: Resource): Map<string, string> => {
+    const renames = new Map<string, string>();
+    for (const c of Array.isArray(resource.contained) ? resource.contained : []) {
+      if (!isObj(c) || typeof c.id !== 'string' || typeof c.resourceType !== 'string') continue;
+      const renamed = mapId(c.resourceType, c.id);
+      if (renamed !== c.id) renames.set(c.id, renamed);
+    }
+    return renames;
+  };
+  const rewrite = (value: unknown, key: string | undefined, renames: ReadonlyMap<string, string>): unknown => {
+    if (typeof value === 'string') {
+      if (key !== 'reference') return value;
+      return value.startsWith('#') ? `#${renames.get(value.slice(1)) ?? value.slice(1)}` : mapReference(value);
+    }
+    if (Array.isArray(value)) return value.map((v) => rewrite(v, key, renames));
     if (!isObj(value)) return value;
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rewrite(v, k)]));
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rewrite(v, k, renames)]));
   };
   const mapResource = <T extends Resource>(resource: T): T => {
-    const rewritten = rewrite(resource, undefined) as Obj;
+    const renames = containedRenames(resource);
+    const rewritten = rewrite(resource, undefined, renames) as Obj;
     if (typeof resource.id === 'string') rewritten.id = mapId(resource.resourceType, resource.id);
+    if (renames.size > 0 && Array.isArray(rewritten.contained)) {
+      rewritten.contained = rewritten.contained.map((c: unknown) =>
+        isObj(c) && typeof c.id === 'string' && renames.has(c.id) ? { ...c, id: renames.get(c.id) } : c,
+      );
+    }
     return rewritten as T;
   };
 

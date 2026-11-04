@@ -111,6 +111,28 @@ describe('parseInput', () => {
   });
 });
 
+describe('hostile NDJSON / JSON shapes', () => {
+  it('rejects a single line over the 64 MB cap with INPUT_TOO_LARGE', async () => {
+    const big = `{"resourceType":"Observation","id":"x","note":"${'a'.repeat(65 * 1024 * 1024)}"}\n`;
+    const path = await file('huge-line.ndjson', big);
+    await expect(loadInput(path)).rejects.toMatchObject({ code: 'INPUT_TOO_LARGE' });
+  }, 60_000);
+
+  it('rejects deep nesting with INPUT_INVALID instead of a RangeError', async () => {
+    const deep = `{"resourceType":"Observation","a":${'['.repeat(1000)}${']'.repeat(1000)}}`;
+    const expected = { code: 'INPUT_INVALID', message: 'Input nesting is too deep.' };
+    await expect(loadInput(await file('deep.ndjson', `${deep}\n`))).rejects.toMatchObject(expected);
+    await expect(loadInput(await file('deep.json', deep))).rejects.toMatchObject(expected);
+    expect(() => parseInput(deep)).toThrow(expect.objectContaining(expected));
+  });
+
+  it('still parses braces inside strings and a final line without newline', async () => {
+    const tricky = JSON.stringify({ resourceType: 'Observation', id: 'q', valueString: '[[[{{{' });
+    const loaded = await loadInput(await file('tricky.ndjson', `${tricky}\n${line('z')}`));
+    expect(loaded.entries.map((e) => e.resource.id)).toEqual(['q', 'z']);
+  });
+});
+
 describe('normalize token accounting', () => {
   it('estimates input tokens from bytes when no raw text is retained', () => {
     const entries = [{ resource: { resourceType: 'Patient', id: 'p1' } }];

@@ -14,7 +14,8 @@
 
 ```bash
 export FHIRBRIDGE_VAULT_PASSPHRASE='use-a-long-passphrase'
-npx fhirbridge pack patient-export.json --vault patient.vault.json > context.md   # de-identified by default
+# De-identified by default. --free-text omit drops all free text: the recommended mode for real data.
+npx fhirbridge pack patient-export.json --vault patient.vault.json --free-text omit > context.md
 ```
 
 FHIRBridge is a zero-config **CLI, SDK and MCP server** that sits between messy EHR FHIR R4 exports and an LLM:
@@ -30,21 +31,36 @@ It runs fully offline, with no Docker, no JVM and no cloud API. The runtime depe
 
 ## Benchmark
 
-Measured by [`scripts/benchmark.mjs`](scripts/benchmark.mjs) on the synthetic fixture in [`tests/fixtures`](tests/fixtures). Run `npm run build && npm run bench` to reproduce.
+Every number below comes from a script in [`scripts/`](scripts) run on the synthetic fixture in
+[`tests/fixtures`](tests/fixtures). To reproduce: `npm run build && npm run bench`, and
+`node --expose-gc scripts/scale-benchmark.mjs 10 100 1000`.
+
+**One patient** ([`scripts/benchmark.mjs`](scripts/benchmark.mjs)):
 
 | Metric | Value |
 | :--- | :--- |
 | Input | 195.9 KB, 95 resources (1 patient, 50 refills, 30 HbA1c results, Base64 notes, PDF) |
-| Tokens before → after | **50,145 → 800 (−98.4%)** |
-| Pack time (normalize + de-identify + compile) | 6–11 ms |
-| CLI cold start (`fhirbridge --version`) | ~90 ms |
-| npm tarball | 159 KB |
-| Identifiers tokenized / dates shifted | 171 / 192 |
+| Tokens before → after | **50,145 → 793 (−98.4%)** |
+| Pack time (normalize + de-identify + compile, median of 15) | 25 ms |
+| CLI cold start (`fhirbridge --version`, median of 5) | 144 ms |
+| npm tarball | 268 KB |
+| Identifiers tokenized / dates shifted | 171 / 190 |
 | Planted PHI strings leaked into the context | **0 / 13** |
+| Date-shift offset leaked into the context | **0** |
 | Clinical terms preserved (`2/12 cores`, `Foley`, `Parkinson's`, `5/5`, drug names) | **6 / 6** |
 | `entered-in-error` excluded / RxNorm code conflicts flagged | 1 / 1 |
 
-Token counts are estimates at 4 bytes per token, applied the same way to input and output. Timings are from Node 24 on Windows x64. Real exports vary; run the script on your own data.
+**Bulk export** ([`scripts/scale-benchmark.mjs`](scripts/scale-benchmark.mjs), one NDJSON file per resource type):
+
+| Patients | Resources | Input | Load | Pack | µs / resource | Peak heap |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 950 | 1.4 MB | 27 ms | 0.26 s | 301 | 19 MB |
+| 100 | 9,500 | 14.1 MB | 168 ms | 1.8 s | 210 | 135 MB |
+| 1,000 | 95,000 | 141.4 MB | 1.6 s | 25.5 s | 285 | 705 MB |
+
+Cost per resource stays roughly flat as the export grows. Token counts are estimates at 4 bytes
+per token, applied the same way to input and output. Timings are from Node 24 on Windows x64 with
+an otherwise idle CPU. Real exports vary, so run the scripts on your own data.
 
 ## What you get
 
@@ -110,28 +126,57 @@ Requires Node.js ≥ 22.12.
 
 | Command | What it does |
 | :--- | :--- |
-| `fhirbridge pack <input> [--no-deid] [--vault <file>] [-f clinical-md\|view-json\|csv\|fhir-slim] [--patient Patient/id] [-o out]` | Layers 1→3. **De-identifies by default.** Context goes to stdout and statistics to stderr. Without `--vault` an in-memory vault is used and rehydration is impossible. |
+| `fhirbridge pack <input> [--no-deid] [--free-text scrub\|omit] [--vault <file>] [-f clinical-md\|view-json\|csv\|fhir-slim] [--patient Patient/id] [-o out]` | Layers 1→3. **De-identifies by default.** Context goes to stdout and statistics to stderr. Without `--vault` an in-memory vault is used and rehydration is impossible. `--patient` accepts the original id even when the output pseudonymized it, and exits 65 when no such patient exists. |
 | `fhirbridge verify <answer.txt> --bundle <input> [--vault <file>] [--rehydrate] [--patient Patient/id] [--json]` | Layer 4 citation audit. With `--vault`, pseudonymized ids the model cites are mapped back to the bundle's ids. Exits 1 on critical findings. |
 | `fhirbridge rehydrate <answer.txt> --vault <file> [--patient Patient/id]` | Restores tokens and reverses the dates the tool shifted. A vault with several patients requires `--patient`. |
 | `fhirbridge audit <input> [--json]` | Resource counts, token savings, PHI found, `entered-in-error` records and code conflicts. Operator-only: its warnings can contain raw values. |
-| `fhirbridge pull --iss <fhir-base> --patient <id> [--no-deid] [--vault <file>]` | Pulls `Patient/$everything` (falling back to a compartment search) from any FHIR R4 server, then packs. De-identifies by default. |
-| `fhirbridge mcp --bundle <input> [--vault <file>] [--allow-rehydrate]` | Starts the MCP server on stdio. |
+| `fhirbridge pull --iss <fhir-base> --patient <id> [--no-deid] [--free-text scrub\|omit] [--vault <file>] [--max-pages <1-10000>] [--allow-private-network]` | Pulls `Patient/$everything` (falling back to a compartment search) from any FHIR R4 server, then packs. De-identifies by default. |
+| `fhirbridge mcp --bundle <input> [--vault <file>] [--free-text scrub\|omit] [--allow-rehydrate]` | Starts the MCP server on stdio. |
+| `fhirbridge doctor` | Checks the Node version, configuration and vault key setup (prints no secret values). |
 
 `--no-deid` (on `pack` and `pull`) switches de-identification off, prints a warning on stderr before anything is written, and produces output with real names, identifiers and dates. Never send that output to an external LLM.
+
+`--free-text omit` is **structured-only mode**: every free-text field and every decoded document is dropped, so no narrative can carry an identifier past the scrubber. It is the recommended mode for real patient data (see [Privacy model and limits](#privacy-model-and-limits)). The default, `scrub`, keeps notes and redacts them on a best-effort basis.
+
+`pull` refuses an `--iss` whose host is an IP literal in a private, loopback, link-local or cloud-metadata range (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`, `fc00::/7`, `fe80::/10`, and IPv4-mapped forms), so a crafted URL cannot probe your internal network. `localhost`, `127.0.0.1` and `[::1]` stay allowed (plain `http:` is accepted for them, for local development). Pass `--allow-private-network` when your FHIR server really lives on an internal address. Only literals are checked: a host name is not resolved, so use egress controls if the name can point inside your network.
 
 `<input>` can be a Bundle, a JSON array of resources, a single resource, an `.ndjson` file, or a Bulk `$export` directory of `.ndjson` files.
 
 `pull` falls back to a compartment search when `$everything` is unsupported. In that search only HTTP 400/404/405 for a resource type are skipped, and each skipped type is reported as a warning; 401/403/408/429/5xx abort the pull instead of returning a partial record. Requests time out after 60 s, a single page is capped at 50 MB, and `--max-pages` applies per resource type.
 
-Secrets come from the environment only, never from argv:
+The input limits apply to a `pull` too: total bytes and resources are counted across **all** pages (raw pages are not kept in memory) and the pull stops with exit 65 when a limit is exceeded. `--max-pages` must be an integer from 1 to 10000. Error messages never contain the server URL.
 
-| Variable | Purpose |
-| :--- | :--- |
-| `FHIRBRIDGE_VAULT_PASSPHRASE` | Derives the vault key (scrypt) |
-| `FHIRBRIDGE_VAULT_KEY` | 64 hex chars; used instead of a passphrase |
-| `FHIRBRIDGE_TOKEN` | Bearer token for `pull` |
+### Configuration reference
 
-A vault key is required: set one of the first two variables. FHIRBridge does not silently create a key file. If you accept the weaker setup where the key sits beside the data, pass `--allow-key-file` explicitly.
+Secrets come from the environment only, never from argv. Invalid values fail fast with exit 78 and name the variable (never its value).
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `FHIRBRIDGE_MAX_INPUT_MB` | `1024` | Maximum total input size in MB (1-65536), also applied across all pages of a `pull`. A single NDJSON line is capped at 64 MB. |
+| `FHIRBRIDGE_MAX_RESOURCES` | `2000000` | Maximum number of FHIR resources accepted from one input (1-50000000). |
+| `FHIRBRIDGE_LOG_FORMAT` | `text` | Diagnostics format on stderr: `text` or `json` (same as `--log-format`). |
+| `FHIRBRIDGE_LOG_LEVEL` | `info` | `silent`, `error`, `warn`, `info` or `debug` (`-q` and `-v` override). |
+| `FHIRBRIDGE_VAULT_PASSPHRASE` | none | Derives the vault key (scrypt); at least 12 characters. |
+| `FHIRBRIDGE_VAULT_KEY` | none | 64 hex chars; used instead of a passphrase. |
+| `FHIRBRIDGE_TOKEN` | none | Bearer token for `pull` (preferred over `--token`, which is visible in `ps`). |
+
+A vault key is required: set `FHIRBRIDGE_VAULT_PASSPHRASE` or `FHIRBRIDGE_VAULT_KEY`. FHIRBridge does not silently create a key file. If you accept the weaker setup where the key sits beside the data, pass `--allow-key-file` explicitly.
+
+### Exit codes
+
+| Exit | Meaning | Codes |
+| ---: | :--- | :--- |
+| 0 | Success | |
+| 1 | Verification found critical clinical issues (an expected outcome, not a crash) | `VERIFY_FAILED` |
+| 64 | Usage error: unknown command, invalid option, vault with several patients and no `--patient` | `USAGE` |
+| 65 | Input is not usable: invalid JSON, too deeply nested, over a size limit, unknown `--patient` | `INPUT_INVALID`, `INPUT_TOO_LARGE` |
+| 66 | Input path does not exist | `INPUT_NOT_FOUND` |
+| 69 | Pull failed: server error, refused address, network failure | `PULL_FAILED` |
+| 70 | Internal error (re-run with `--debug`) | `INTERNAL` |
+| 74 | Vault file I/O error | `VAULT_IO` |
+| 75 | Temporary failure: vault changed by another process, or the pull timed out | `VAULT_CONFLICT`, `PULL_TIMEOUT` |
+| 77 | Permission: wrong vault key, or the FHIR server refused the token (401/403) | `VAULT_DECRYPT_FAILED`, `PULL_AUTH` |
+| 78 | Configuration: invalid `FHIRBRIDGE_*` value or no vault key | `CONFIG_INVALID`, `VAULT_KEY_MISSING` |
 
 ## MCP: Claude Desktop, Cursor, OpenCode
 
@@ -180,26 +225,29 @@ Each layer is also published on its own: `fhirbridge/normalizer`, `fhirbridge/de
 
 ## Architecture
 
-```text
-  FHIR Bundle / NDJSON / Bulk $export / SMART $everything
-                     │
-   ┌─────────────────▼──────────────────┐
-   │ 1  Normalizer                      │  reference graph · Base64/HTML/RTF decode · id/meta repair
-   │                                    │  status gate · RxNorm brand→ingredient · code/display lint
-   └─────────────────┬──────────────────┘
-   ┌─────────────────▼──────────────────┐
-   │ 2  De-identification + vault       │  tokens [PATIENT_1] [MRN_1] … · per-patient Δt ∈ [−365, −2]
-   │    (AES-256-GCM, HKDF subkeys)     │  eponym/fraction guards · ZIP3 · age > 89 → 90+
-   └─────────────────┬──────────────────┘
-   ┌─────────────────▼──────────────────┐
-   │ 3  Context compiler                │  clinical-md with [Type/id] anchors · SQL-on-FHIR views
-   └─────────────────┬──────────────────┘
-                     ▼   LLM / MCP agent
-   ┌────────────────────────────────────┐
-   │ 4  Verifier                        │  hallucinated ids · status contradictions · numeric fidelity
-   │                                    │  rehydrate (batch + streaming hold-back buffer)
-   └────────────────────────────────────┘
+```mermaid
+flowchart LR
+  subgraph Input
+    A1[Bundle / array / resource .json]
+    A2[NDJSON file]
+    A3[Bulk $export directory]
+    A4[SMART pull: $everything or compartment search]
+  end
+  A1 & A2 & A3 --> L[input-loader<br/>streaming, byte + resource budget]
+  A4 --> L2[smart-client<br/>same-origin paging, timeouts, size caps]
+  L --> N
+  L2 --> N
+  N[1 · Normalizer<br/>reference graph, decode, status gate, RxNorm lint] --> D
+  D[2 · De-identification<br/>tokens, per-patient date shift, DOB→year, id pseudonyms] --> C
+  D <-->|AES-256-GCM| V[(Vault file)]
+  C[3 · Compiler<br/>clinical-md, views, CSV, fhir-slim] --> LLM{{LLM / MCP agent}}
+  LLM --> R[4 · Verifier<br/>citation audit]
+  N -. original graph .-> R
+  V -. tokens, emitted dates, id map .-> R
+  R --> OUT[Audit report + local rehydration]
 ```
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) covers the invariants, the vault format and the resource limits.
 
 ## Privacy model and limits
 
@@ -207,6 +255,7 @@ Read this before using it with real patient data.
 
 - **This is not strict HIPAA Safe Harbor.** Safe Harbor requires removing all elements of dates except the year. FHIRBridge removes or tokenizes the 18 identifier categories and reduces the date of birth to the year (ages over 89 become `90+`), but by default it **shifts** all other dates by a secret per-patient offset instead of removing them. Date shifting is a technique used under Expert Determination, not under Safe Harbor, and it keeps day-level information that Safe Harbor would remove. Treat the output as de-identified for LLM use under your own risk assessment, not as a Safe Harbor determination, and have your privacy officer or an expert validate it before data leaves your control.
 - **De-identification is the default and can be turned off.** `pack` and `pull` de-identify unless you pass `--no-deid`, which prints a warning and outputs real identifiers and dates.
+- **For real patient data, use `--free-text omit` ("structured-only").** It removes all free text and decoded documents, so the output consists of coded and structured fields only. Free-text scrubbing (`--free-text scrub`, the default) is **best-effort and not Safe Harbor-complete**. Known gaps: names with no cue word that are not registered from a structured field, identifiers that carry no label (a bare number in a sentence), and unusual date formats (for example `5th of March 1930`, `03.05.30`, dates spelled in another language or split across lines). It also cannot recognise facts that identify a person without being an identifier. Use `scrub` only on data you have validated on a sample.
 - **Free-text detection is heuristic.** Structured fields are handled for all 18 identifier categories, and biometrics and photos are handled by removing attachment payloads. In free text, names are found through dictionaries, names registered from structured fields, and cue words (`Pt`, `Dr.`, `signed by`, relationship words such as `mother` or `husband`, and CJK, Vietnamese and Korean honorific cues). A name with no cue that is not registered from a structured field can be missed. Validate the output on a sample of your own notes before relying on it.
 - **The vault contains PHI** (encrypted). Anyone holding the vault and its key can reverse the tokens. The key must come from the environment (`FHIRBRIDGE_VAULT_PASSPHRASE` or `FHIRBRIDGE_VAULT_KEY`); a key file next to the vault is used only with `--allow-key-file`. Keep the key off the machine that talks to the LLM.
 - **Rehydration reverses only dates the tool emitted.** The vault records the exact shifted dates it produced for each patient. Any other date, such as a guideline year or a date the model computed, is left exactly as written. A vault that holds several patients requires you to name one (`--patient Patient/id`).
@@ -215,11 +264,70 @@ Read this before using it with real patient data.
 - **The RxNorm dictionary is small.** It covers common outpatient drugs and known bad codes. It is not a terminology server.
 - **This is not a medical device.** The verifier reduces some failure modes; it does not make model output clinically safe.
 
+## Production runbook
+
+### Docker with read-only mounts
+
+The image is distroless, runs as `nonroot`, and has no shell. Mount the input read-only and give the vault its own writable volume; nothing else on the container needs to be writable.
+
+```bash
+docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -e FHIRBRIDGE_VAULT_PASSPHRASE \
+  -v "$PWD/exports:/data/in:ro" \
+  -v fhirbridge-vaults:/data/vault \
+  ghcr.io/digital-healthcare-opensource/fhirbridge \
+  pack /data/in/patient.json --vault /data/vault/patient.vault.json --free-text omit > context.md
+```
+
+Pass the key with `-e NAME` (inherits from your shell) rather than `-e NAME=value`, so it does not appear in `docker inspect` or shell history. Keep the vault volume on a different host or account than the one that sends context to the LLM.
+
+### Key management and rotation
+
+- Generate a long random passphrase (or a 64-hex `FHIRBRIDGE_VAULT_KEY`) and keep it in a secret manager; inject it as an environment variable at run time. Never put it in argv, an image, or a repository.
+- A vault is encrypted with one key and the key cannot be changed in place. **To rotate, re-pack into a new vault:** export the data again, run `pack` with the new key and a new `--vault` path, switch consumers to the new vault, then securely delete the old vault and retire the old key. Tokens and date offsets in the new vault differ from the old one, so answers produced from the old context can be rehydrated only with the old vault. Keep it until those answers are no longer needed.
+- Treat a lost key as a lost vault: there is no recovery, and rehydration becomes impossible (the de-identified context stays valid).
+- If a key may have been exposed, rotate it and treat the old vault as compromised.
+
+### Pre-flight and monitoring
+
+- `fhirbridge doctor` checks the Node version, the `FHIRBRIDGE_*` configuration and the vault key setup without printing any secret. Run it as a deployment smoke test; it exits 78 on a problem.
+- Use `--log-format json` (or `FHIRBRIDGE_LOG_FORMAT=json`) to get one JSON event per line on stderr, ready for a log shipper such as Fluent Bit, Vector or the Datadog agent. Events carry counts, codes and durations only, never patient values. Set `FHIRBRIDGE_LOG_LEVEL=warn` in steady state. stdout carries only the context, so redirect or pipe it separately from stderr.
+
+### Exit codes in pipelines
+
+```bash
+fhirbridge pack export.json --vault v.vault.json --free-text omit -o context.md
+case $? in
+  0)  ;;                                              # success
+  65) echo "bad or oversized input"; exit 1 ;;        # fix the export, do not retry
+  69|75) sleep 30; retry ;;                           # transient: pull failed, timeout, vault busy
+  77|78) echo "credentials or config"; exit 1 ;;      # page the operator, do not retry
+  *)  echo "unexpected"; exit 1 ;;
+esac
+```
+
+`fhirbridge verify` exits 1 when the model contradicts the record: treat that as a gate (block the answer), not as an error.
+
+### Troubleshooting by exit code
+
+| Exit | Likely cause | What to do |
+| ---: | :--- | :--- |
+| 1 | The answer cites ids that do not exist, or calls a stopped drug current | Read the issue list on stderr; regenerate the answer. |
+| 64 | Misspelled option, invalid `--format`, `--free-text` or `--max-pages`; `rehydrate` on a vault with several patients | Check `--help`; add `--patient Patient/id`. |
+| 65 | Truncated or non-FHIR JSON, nesting over 256 levels, a single NDJSON line over 64 MB, input over the limits, or `--patient` that is not in the input | Validate the export; raise `FHIRBRIDGE_MAX_INPUT_MB` / `FHIRBRIDGE_MAX_RESOURCES` or split by patient. |
+| 66 | Wrong path, or the container mount is missing | Check the `-v` mapping. |
+| 69 | HTTP error from the server, unreachable host, or an `--iss` on a private address | Check the URL; add `--allow-private-network` for an internal server. |
+| 70 | Bug | Re-run with `--debug` (its output may contain input data; do not share it) and open an issue with a synthetic reproduction. |
+| 74 | Vault path not writable, disk full | Fix permissions or space on the vault volume. |
+| 75 | Another process changed the vault, or the server timed out | Re-run; serialize runs that share a vault. |
+| 77 | Wrong vault passphrase, or the server rejected the token | Check the secret and the token scopes. |
+| 78 | Invalid `FHIRBRIDGE_*` value, or no vault key | Run `fhirbridge doctor`. |
+
 ## Development
 
 ```bash
 npm ci
-npm test          # 109 tests: one suite per layer, end-to-end, MCP (in-memory client), SMART client
+npm test          # 200+ tests: one suite per layer, end-to-end, MCP (in-memory client), SMART client
 npm run lint      # tsc --noEmit (strict)
 npm run build
 npm run fixtures  # regenerate the synthetic fixture

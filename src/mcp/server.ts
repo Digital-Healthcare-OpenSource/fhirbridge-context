@@ -8,9 +8,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { compile } from '../compiler/index.js';
+import { compile, slimResource } from '../compiler/index.js';
 import { safeWarnings } from '../compiler/sections/safe-warnings.js';
-import { SafeHarborVault } from '../deid/index.js';
+import { SafeHarborVault, type FreeTextMode } from '../deid/index.js';
 import { pack, VERSION, type PackResult } from '../index.js';
 import { loadInput } from '../normalizer/index.js';
 import { silentLogger, type Logger } from '../logger.js';
@@ -30,6 +30,8 @@ export interface McpServerOptions {
    * shown). Off by default; only for models running locally.
    */
   allowRehydrate?: boolean;
+  /** `omit` serves structured data only (no free text / documents). Default `scrub`. */
+  freeText?: FreeTextMode;
   /** Diagnostics sink (stderr). Tool calls are logged by name, outcome and duration — never arguments. */
   logger?: Logger;
 }
@@ -84,11 +86,8 @@ function codesOf(r: Resource): string[] {
   return out.map((s) => s.toLowerCase());
 }
 
-/** Drop transport noise so the model sees clinical content only. */
-function slim(r: Resource): Resource {
-  const { meta: _meta, text: _text, ...rest } = r;
-  return rest as Resource;
-}
+/** Same hygiene as the `fhir-slim` format: no meta, extensions, primitive extensions, hashes or narrative. */
+const slim = (r: Resource): Resource => slimResource(r);
 
 export interface ResourceQuery {
   resourceType: string;
@@ -262,7 +261,11 @@ export async function createMcpServer(opts: McpServerOptions): Promise<McpServer
         allowKeyFile: opts.allowKeyFile === true,
       })
     : SafeHarborVault.create();
-  const packed = pack(await loadInput(opts.bundlePath), { deid: true, vault });
+  const packed = pack(await loadInput(opts.bundlePath), {
+    deid: true,
+    vault,
+    freeText: opts.freeText,
+  });
   if (!packed.deidGraph || !packed.vault || !packed.safeHarbor) throw new Error('De-identification did not run.');
   if (opts.vaultPath) await vault.save(opts.vaultPath);
   const state: ServerState = {

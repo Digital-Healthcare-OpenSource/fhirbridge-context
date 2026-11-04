@@ -1,9 +1,10 @@
 /** Per-datatype Safe Harbor handlers used by the structured walker (safe-harbor-rules.ts). */
 import { generalizeZip } from '../dictionaries/hipaa-zip3.js';
 import type { PhiCategory } from '../types/pipeline.js';
-import { collectNameVariants, isHumanName } from './name-collect.js';
+import { DROP } from './date-shifter.js';
+import { collectNameVariants, isHumanName, normalizeNames } from './name-collect.js';
 import { scrubText } from './clinical-text-scrubber.js';
-import type { KnownName, NameCategory, ScrubContext } from './scrub-types.js';
+import type { FreeTextMode, KnownName, NameCategory, ScrubContext } from './scrub-types.js';
 import { canonicalName } from './vault-names.js';
 import type { SafeHarborVault } from './vault.js';
 
@@ -30,6 +31,10 @@ export interface RulesContext {
   /** Day offset for this resource's owner; undefined generalizes every date to its year. */
   dateShiftDays?: number;
   knownNames: readonly KnownName[];
+  /** Names of the other patients in the graph (see ScrubContext.otherNames). */
+  otherNames?: readonly KnownName[];
+  /** `omit` removes every free-text field instead of scrubbing it. Defaults to `scrub`. */
+  freeText?: FreeTextMode;
   stats: RuleStats;
   onDiscovered?: ScrubContext['onDiscovered'];
 }
@@ -75,6 +80,7 @@ export function scrub(ctx: RulesContext, text: string): string {
     patientKey: ctx.patientKey,
     now: ctx.now,
     knownNames: ctx.knownNames,
+    otherNames: ctx.otherNames,
     dateShiftDays: ctx.dateShiftDays,
     onDiscovered: ctx.onDiscovered,
   });
@@ -88,47 +94,65 @@ export function scrub(ctx: RulesContext, text: string): string {
   return r.text;
 }
 
-/** HumanName / HumanName[] -> one pseudonymous name (undefined when nothing usable remains). */
-export function humanNames(ctx: RulesContext, v: unknown, category: NameCategory): unknown {
-  const items = (Array.isArray(v) ? v : [v]).filter(isObj);
-  const variants = collectNameVariants(items as never);
-  if (variants.every((x) => canonicalName(x).length === 0)) return Array.isArray(v) ? [] : undefined;
+/**
+ * Apply `fn` to every scalar of a PHI-typed member. Scalars are coerced to strings (a phone number
+ * written as a JSON number is still a phone number), arrays are mapped element-wise, and any
+ * other shape (object, boolean, null) is DROPPED: a PHI member is never passed through raw.
+ */
+export function mapPhi(v: unknown, fn: (s: string) => unknown, depth = 0): unknown {
+  if (depth > MAX_PHI_DEPTH) return DROP;
+  if (typeof v === 'string') return v.trim() ? fn(v) : v;
+  if (typeof v === 'number' || typeof v === 'bigint') return fn(String(v));
+  if (Array.isArray(v)) return v.map((e) => mapPhi(e, fn, depth + 1)).filter((e) => e !== DROP);
+  return DROP;
+}
+const MAX_PHI_DEPTH = 6;
+
+/**
+ * HumanName / HumanName[] / string / nested arrays -> one pseudonymous name. Returns DROP when
+ * nothing usable remains. `asArray` keeps the FHIR cardinality of the member being rewritten.
+ */
+export function humanNames(ctx: RulesContext, v: unknown, category: NameCategory, asArray: boolean): unknown {
+  const items = normalizeNames(v);
+  const variants = collectNameVariants(items);
+  if (variants.every((x) => canonicalName(x).length === 0)) return DROP;
   bump(ctx, category);
   const token = ctx.vault.registerName(category, variants, { patientKey: ctx.patientKey });
-  const use = items[0]?.use;
+  const use = isObj(v) ? v.use : Array.isArray(v) && isObj(v[0]) ? v[0].use : undefined;
   const one = { ...(typeof use === 'string' ? { use } : {}), text: token, family: token };
-  return Array.isArray(v) ? [one] : one;
+  return asArray ? [one] : one;
 }
 
 export const looksLikeHumanNames = (v: unknown): boolean =>
   Array.isArray(v) ? v.length > 0 && v.every(isHumanName) : isHumanName(v);
 
+export function contactCategory(system: string, value: string): PhiCategory {
+  if (system === 'fax') return 'FAX';
+  if (system === 'email' || (system !== 'phone' && value.includes('@'))) return 'EMAIL';
+  return system === 'url' ? 'URL' : 'PHONE';
+}
+
 export function contactPointValue(ctx: RulesContext, cp: Obj): unknown {
-  if (typeof cp.value !== 'string' || !cp.value) return cp.value;
   const sys = typeof cp.system === 'string' ? cp.system : '';
-  let category: PhiCategory = 'PHONE';
-  if (sys === 'fax') category = 'FAX';
-  else if (sys === 'email' || (sys !== 'phone' && cp.value.includes('@'))) category = 'EMAIL';
-  else if (sys === 'url') category = 'URL';
-  return tokenize(ctx, category, cp.value);
+  return mapPhi(cp.value, (s) => tokenize(ctx, contactCategory(sys, s), s));
 }
 
 /** Overrides for Address members; every other member goes through the generic walker. */
 export function addressOverride(ctx: RulesContext, key: string, v: unknown): unknown {
-  if (key === 'text' && typeof v === 'string') return tokenize(ctx, 'ADDRESS', v);
-  if (key === 'line' && Array.isArray(v)) {
-    return v.map((l) => (typeof l === 'string' && l.trim() ? tokenize(ctx, 'ADDRESS', l) : l));
+  if (key === 'postalCode') {
+    return mapPhi(v, (s) => {
+      const z = generalizeZip(s);
+      if (z.restricted) ctx.stats.zip3Restricted += 1;
+      else ctx.stats.zip3Generalized += 1;
+      return z.value;
+    });
   }
-  if ((key === 'city' || key === 'district') && typeof v === 'string' && v.trim()) {
-    return tokenize(ctx, 'ADDRESS', v);
-  }
-  if (key === 'postalCode' && typeof v === 'string') {
-    const z = generalizeZip(v);
-    if (z.restricted) ctx.stats.zip3Restricted += 1;
-    else ctx.stats.zip3Generalized += 1;
-    return z.value;
-  }
-  return undefined;
+  return mapPhi(v, (s) => tokenize(ctx, 'ADDRESS', s));
+}
+
+/** Identifier.value / Coverage.class.value: tokenized whatever JSON type it arrives as. */
+export function tokenizedValue(ctx: RulesContext, category: PhiCategory, v: unknown): unknown {
+  return mapPhi(v, (s) => tokenize(ctx, category, s));
 }
 
 export function identifierCategory(id: Obj, resourceType: string | undefined): PhiCategory {
@@ -170,6 +194,8 @@ export const KEY_CATEGORY: Readonly<Record<string, PhiCategory>> = {
   subscriberId: 'HEALTH_PLAN',
   serialNumber: 'DEVICE',
   deviceIdentifier: 'DEVICE',
+  carrierHRF: 'DEVICE',
+  carrierAIDC: 'DEVICE',
   lotNumber: 'DEVICE',
   alias: 'ORG',
 };

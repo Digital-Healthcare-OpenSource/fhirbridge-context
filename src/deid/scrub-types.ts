@@ -4,10 +4,22 @@ import type { SafeHarborVault } from './vault.js';
 
 export type NameCategory = 'PATIENT' | 'PROVIDER' | 'PERSON';
 
+/**
+ * How free-text fields are handled: `scrub` pseudonymizes the PHI inside them, `omit` removes
+ * them (and every decoded document) so only structured codes and values remain.
+ */
+export type FreeTextMode = 'scrub' | 'omit';
+
 export interface KnownName {
-  /** ADDRESS entries are place terms (city, district, street) swept as whole phrases. */
-  category: NameCategory | 'ADDRESS';
+  /**
+   * ADDRESS entries are place terms (city, district, street) swept as whole phrases.
+   * IDENTIFIER entries hold one structured identifier value (MRN, phone, email, plan id...) of
+   * `idCategory`, swept from free text with digit normalization.
+   */
+  category: NameCategory | 'ADDRESS' | 'IDENTIFIER';
   variants: string[];
+  /** Token category of an IDENTIFIER entry. */
+  idCategory?: PhiCategory;
   /** Owner of a PATIENT name (defaults to the scrub context's patientKey). */
   patientKey?: string;
   /**
@@ -22,6 +34,11 @@ export interface ScrubContext {
   patientKey?: string;
   now?: Date;
   knownNames?: readonly KnownName[];
+  /**
+   * Names of the OTHER patients in the graph, swept after `knownNames` so a cross-patient mention
+   * is tokenized with that patient's own token. One list shared by every patient's context.
+   */
+  otherNames?: readonly KnownName[];
   dateShiftDays?: number;
   /** Receives every name discovered by a cue heuristic (for a second, consistent sweep). */
   onDiscovered?: (name: KnownName) => void;

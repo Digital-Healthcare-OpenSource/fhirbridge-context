@@ -1,19 +1,31 @@
 /**
  * Structured-field Safe Harbor rules: walks one resource tree DEFAULT-DENY. Every string
- * leaf is either (a) a date, handled by date-shifter.ts, (b) a known non-PHI member
- * (code/system/reference/status...), (c) a typed identifier member, or (d) scrubbed as free
- * text. Typed datatypes (HumanName, Address, ContactPoint, Identifier) are recognised by the
- * member that holds them, including `value[x]` and extensions. Never mutates its input.
+ * leaf is either (a) a date, handled by date-shifter.ts, (b) a structural member (code, system,
+ * unit, status...) that must pass a strict shape check, (c) a typed identifier member, or
+ * (d) scrubbed as free text. Typed datatypes (HumanName, Address, ContactPoint, Identifier) are
+ * recognised by the member that holds them, including `value[x]` and extensions, and are handled
+ * for EVERY JSON type (string, number, array, object): an unexpected shape is dropped, never
+ * passed through raw. Never mutates its input.
  */
+import {
+  isAgeKey,
+  capAgeQuantity,
+  isBirthExtensionUrl,
+  isBirthKey,
+  isClinicalNumber,
+  MOTHERS_MAIDEN_RE,
+  reduceBirth,
+  reduceBirthExtensionValue,
+} from './birth-age-rules.js';
 import {
   DROP,
   MAX_UNCAPPED_AGE,
   ageExtension,
-  birthDateOutcome,
   dateLeaf,
   isAgeExtension,
   type DateWalk,
 } from './date-shifter.js';
+import { validateReference, validateStructural, validateUri } from './leaf-validators.js';
 import {
   KEY_CATEGORY,
   ORG_NAME_TYPES,
@@ -24,9 +36,11 @@ import {
   identifierCategory,
   isObj,
   looksLikeHumanNames,
+  mapPhi,
   referenceDisplay,
   scrub,
   tokenize,
+  tokenizedValue,
   type Obj,
   type RulesContext,
 } from './structured-handlers.js';
@@ -58,13 +72,15 @@ export const SAFE_HARBOR_RULE_NAMES: readonly string[] = [
 ];
 
 const ORIGINAL_ID_URL = 'https://fhirbridge.dev/fhir/StructureDefinition/original-id';
-/** String members that are structural codes/ids, never PHI: passed through untouched. */
-const NON_PHI_KEYS: ReadonlySet<string> = new Set([
-  'resourceType', 'id', 'reference', 'system', 'code', 'version', 'versionId', 'status', 'intent',
-  'use', 'gender', 'unit', 'contentType', 'language', 'criticality', 'severity', 'comparator',
-  'profile', 'fullUrl', 'valueCode', 'priority', 'type',
+export const BINARY_REMOVED = '[BINARY_REMOVED]';
+const BASE64_MIN_LENGTH = 64;
+const BASE64_BODY = /^[A-Za-z0-9+/]+={0,2}$/;
+/** Members that hold free text; `omit` mode removes them (CodeableConcept.text is handled apart). */
+const FREE_TEXT_KEYS: ReadonlySet<string> = new Set([
+  'note', 'description', 'conclusion', 'comment', 'summary', 'valueString', 'contentString',
+  'patientInstruction', 'reasonText', 'valueMarkdown',
 ]);
-const MOTHERS_MAIDEN = /mother.?s?.?maiden/i;
+const SAMPLED_DATA = /^[\d\s.eE+\-LU]*$/;
 
 interface State {
   ctx: RulesContext;
@@ -77,6 +93,14 @@ const isIdentifierMember = (key: string | undefined): boolean =>
   key === 'identifier' || (key !== undefined && key.endsWith('Identifier'));
 const isOriginalId = (e: unknown): boolean => isObj(e) && e.url === ORIGINAL_ID_URL;
 const isExtensionKey = (key: string | undefined): boolean => key === 'extension' || key === 'modifierExtension';
+const isResource = (obj: Obj): boolean => typeof obj.resourceType === 'string';
+
+/** A long run of base64 characters is an embedded payload, whatever member carries it. */
+function looksLikeBase64(v: string): boolean {
+  if (v.length < BASE64_MIN_LENGTH) return false;
+  const body = v.replace(/[\r\n]/g, '');
+  return BASE64_BODY.test(body) && body.length % 4 !== 1;
+}
 
 /** Members of typed datatypes that carry PHI, chosen by the member that holds the datatype. */
 function overridesFor(s: State, obj: Obj, container: string | undefined, rt: string | undefined): Overrides {
@@ -85,32 +109,41 @@ function overridesFor(s: State, obj: Obj, container: string | undefined, rt: str
   }
   if (container === 'address' || container === 'valueAddress') {
     return Object.fromEntries(
-      ['text', 'line', 'city', 'district', 'postalCode'].map((k) => [k, (v: unknown) => addressOverride(s.ctx, k, v) ?? v]),
+      ['text', 'line', 'city', 'district', 'postalCode'].map((k) => [k, (v: unknown) => addressOverride(s.ctx, k, v)]),
     );
   }
   if (isIdentifierMember(container)) {
-    return { value: (v) => (typeof v === 'string' && v ? tokenize(s.ctx, identifierCategory(obj, rt), v) : v) };
+    return { value: (v) => tokenizedValue(s.ctx, identifierCategory(obj, rt), v) };
   }
-  if (isExtensionKey(container) && MOTHERS_MAIDEN.test(String(obj.url ?? ''))) {
-    return { valueString: (v) => (typeof v === 'string' && v.trim() ? tokenize(s.ctx, 'PERSON', v) : v) };
+  if (container === 'class' && rt === 'Coverage') {
+    return { value: (v) => tokenizedValue(s.ctx, 'HEALTH_PLAN', v) };
+  }
+  if (isExtensionKey(container) && MOTHERS_MAIDEN_RE.test(String(obj.url ?? ''))) {
+    return { valueString: (v) => mapPhi(v, (x) => tokenize(s.ctx, 'PERSON', x)) };
   }
   return {};
 }
 
+function walkUrl(s: State, v: string, obj: Obj, container: string | undefined): string {
+  if (typeof obj.contentType === 'string') return tokenize(s.ctx, 'URL', v); // Attachment.url
+  const extensionLike = isExtensionKey(container) || Object.keys(obj).some((k) => k.startsWith('value'));
+  return extensionLike ? validateUri(s.ctx, v) : scrub(s.ctx, v);
+}
+
 function walkString(s: State, key: string, v: string, obj: Obj, container: string | undefined, rt: string | undefined): unknown {
+  if (looksLikeBase64(v)) return BINARY_REMOVED;
   const date = dateLeaf(v, key, s.dates);
   if (date !== null) return date;
-  if (key === 'url') {
-    if (typeof obj.contentType === 'string') return tokenize(s.ctx, 'URL', v); // Attachment.url
-    const extensionLike = isExtensionKey(container) || Object.keys(obj).some((k) => k.startsWith('value'));
-    return extensionLike ? v : scrub(s.ctx, v);
-  }
-  if (NON_PHI_KEYS.has(key)) return v;
+  if (key === 'url') return walkUrl(s, v, obj, container);
+  if (key === 'resourceType' || key === 'id') return v;
+  if (key === 'reference') return validateReference(s.ctx, v);
+  const structural = validateStructural(s.ctx, key, v, container);
+  if (structural !== undefined) return structural;
   const category = KEY_CATEGORY[key];
   if (category && v.trim()) return tokenize(s.ctx, category, v);
   if (key === 'name' && v.trim()) {
     if (container === 'deviceName') return tokenize(s.ctx, 'DEVICE', v);
-    if (rt && ORG_NAME_TYPES.has(rt) && typeof obj.resourceType === 'string') return tokenize(s.ctx, 'ORG', v);
+    if (rt && ORG_NAME_TYPES.has(rt) && isResource(obj)) return tokenize(s.ctx, 'ORG', v);
   }
   if (key === 'display') {
     const isCoding = container === 'coding' || 'code' in obj || 'system' in obj || 'version' in obj;
@@ -119,30 +152,74 @@ function walkString(s: State, key: string, v: string, obj: Obj, container: strin
   return scrub(s.ctx, v);
 }
 
+/** One array element or scalar member: strings, numbers, nested arrays and objects. */
+function walkElement(s: State, key: string, v: unknown, obj: Obj, rt: string | undefined, container: string | undefined): unknown {
+  if (typeof v === 'string') return walkString(s, key, v, obj, container, rt);
+  if (typeof v === 'number' || typeof v === 'bigint') {
+    return typeof v === 'number' && isClinicalNumber(key, obj, container)
+      ? v
+      : walkString(s, key, String(v), obj, container, rt);
+  }
+  if (Array.isArray(v)) return v.map((e) => walkElement(s, key, e, obj, rt, container)).filter((e) => e !== DROP);
+  return isObj(v) ? walkObject(s, v, rt, key) : v;
+}
+
 /** Walk one member value (string / array / object / scalar). */
 function walkMember(s: State, key: string, v: unknown, obj: Obj, rt: string | undefined, container: string | undefined): unknown {
-  if (typeof v === 'string') return walkString(s, key, v, obj, container, rt);
-  if (Array.isArray(v)) {
-    const items = isExtensionKey(key) ? v.filter((e) => !isOriginalId(e) && !isAgeExtension(e)) : v;
-    return items.map((el) => {
-      if (typeof el === 'string') return walkString(s, key, el, obj, container, rt);
-      return isObj(el) ? walkObject(s, el, rt, key) : el;
-    });
+  if (Array.isArray(v) && isExtensionKey(key)) {
+    const kept = v.filter((e) => !isOriginalId(e) && !isAgeExtension(e));
+    return kept.map((e) => walkElement(s, key, e, obj, rt, container)).filter((e) => e !== DROP);
   }
-  return isObj(v) ? walkObject(s, v, rt, key) : v;
+  return walkElement(s, key, v, obj, rt, container);
+}
+
+/** SampledData.data is a clinical waveform (numbers only); every other `data` is a payload. */
+const keepsData = (obj: Obj, v: unknown): boolean =>
+  'dimensions' in obj && typeof v === 'string' && SAMPLED_DATA.test(v);
+
+function keepsCodeableText(obj: Obj, text: string): boolean {
+  const wanted = text.trim().toLowerCase();
+  const codings = Array.isArray(obj.coding) ? obj.coding : [];
+  return codings.some((c) => isObj(c) && typeof c.display === 'string' && c.display.trim().toLowerCase() === wanted);
+}
+
+/** `omit` mode: free-text members are removed; CodeableConcept.text survives only as a display. */
+function isOmittedFreeText(s: State, key: string, v: unknown, obj: Obj): boolean {
+  if (s.ctx.freeText !== 'omit') return false;
+  if (FREE_TEXT_KEYS.has(key)) return true;
+  return key === 'text' && !(typeof v === 'string' && keepsCodeableText(obj, v));
+}
+
+function personCategoryOf(obj: Obj, rt: string | undefined) {
+  return isResource(obj) && rt ? PERSON_CATEGORY[rt] : undefined;
+}
+
+function walkName(s: State, key: string, v: unknown, obj: Obj, rt: string | undefined, container: string | undefined): unknown {
+  const personal = personCategoryOf(obj, rt);
+  if (key === 'name' && personal) return humanNames(s.ctx, v, personal, true); // any shape: Patient.name
+  if ((key === 'name' || key === 'valueHumanName') && looksLikeHumanNames(v)) {
+    return humanNames(s.ctx, v, 'PERSON', Array.isArray(v));
+  }
+  if (key === 'name' && typeof v === 'string' && container === 'contact') return humanNames(s.ctx, v, 'PERSON', false);
+  return undefined;
 }
 
 function walkProp(s: State, key: string, v: unknown, obj: Obj, rt: string | undefined, container: string | undefined, over: Overrides): unknown {
   if (key === 'photo' || key === 'div') return DROP;
-  if (key === 'position' && rt === 'Location' && typeof obj.resourceType === 'string') return DROP;
-  if (key === 'data' && typeof obj.contentType === 'string') return DROP;
+  if (key === 'position' && rt === 'Location' && isResource(obj)) return DROP;
+  if (key === 'data') return keepsData(obj, v) ? v : DROP;
+  if (key.startsWith('_') && isBirthKey(key.slice(1))) return DROP;
+  if (key === 'id' && !isResource(obj)) return DROP; // element ids: only Resource.id (and contained ids) survive
   if (key === 'text' && isObj(v)) return DROP; // Narrative
+  if (isOmittedFreeText(s, key, v, obj)) return DROP;
   const override = over[key];
   if (override) return override(v);
-  if ((key === 'name' || key === 'valueHumanName') && looksLikeHumanNames(v)) {
-    const isResource = typeof obj.resourceType === 'string';
-    const category = (isResource && rt ? PERSON_CATEGORY[rt] : undefined) ?? 'PERSON';
-    return humanNames(s.ctx, v, category) ?? DROP;
+  const named = walkName(s, key, v, obj, rt, container);
+  if (named !== undefined) return named;
+  if (isAgeKey(key) && isObj(v)) {
+    const { value, capped } = capAgeQuantity(v);
+    if (capped) s.ctx.stats.agesCapped += 1;
+    return walkMember(s, key, value, obj, rt, container);
   }
   return walkMember(s, key, v, obj, rt, container);
 }
@@ -150,15 +227,21 @@ function walkProp(s: State, key: string, v: unknown, obj: Obj, rt: string | unde
 function walkObject(s: State, obj: Obj, rt: string | undefined, container: string | undefined): Obj {
   const here = typeof obj.resourceType === 'string' ? obj.resourceType : rt;
   const over = overridesFor(s, obj, container, here);
+  const birthExtension = isBirthExtensionUrl(obj.url);
   const out: Obj = {};
   let age: number | undefined;
   for (const [k, v] of Object.entries(obj)) {
-    if (k === 'birthDate') {
-      // Safe Harbor: the year only, and nothing above age 89.
-      const b = typeof v === 'string' ? birthDateOutcome(v, s.ctx.now) : {};
-      age = b.age;
+    if (isBirthKey(k) && !k.startsWith('_') && k !== 'url') {
+      // Safe Harbor: the year only, and nothing above age 89; any non-scalar shape is dropped.
+      const b = reduceBirth(v, s.ctx.now);
+      if (k === 'birthDate') age = b.age;
       if (b.age !== undefined && b.age > MAX_UNCAPPED_AGE) s.ctx.stats.agesCapped += 1;
       if (b.year !== undefined) out[k] = b.year;
+      continue;
+    }
+    if (birthExtension && k.startsWith('value')) {
+      const r = reduceBirthExtensionValue(obj.url, k, v, s.ctx.now);
+      if (r !== DROP) out[k] = r;
       continue;
     }
     const r = walkProp(s, k, v, obj, here, container, over);

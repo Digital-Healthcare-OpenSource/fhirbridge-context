@@ -1,7 +1,9 @@
-# Production audit & state
+# Production audit & state (superseded)
 
-Working state for the production-hardening pass. Converted into ARCHITECTURE.md / CHANGELOG.md
-and deleted when every item below is `[x]`.
+> **Complete — superseded by [ARCHITECTURE.md](ARCHITECTURE.md) and [CHANGELOG.md](CHANGELOG.md).**
+> Kept only as a record of the hardening pass; safe to delete (`git rm PRODUCTION_AUDIT_AND_STATE.md`).
+
+Working state for the production-hardening pass.
 
 ## What this project is
 

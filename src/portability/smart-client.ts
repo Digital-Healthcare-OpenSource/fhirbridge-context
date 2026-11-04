@@ -5,9 +5,12 @@
  * Security: pagination (`Bundle.link[next]`) is only followed to the same origin as
  * `iss`, so a malicious server cannot make us send the bearer token elsewhere.
  */
+import { loadRuntimeConfig, type RuntimeLimits } from '../config.js';
+import { FhirBridgeError } from '../errors.js';
 import type { Bundle, Resource } from '../types/fhir.js';
 import { isResource } from '../types/fhir.js';
 import type { InputEntry, LoadedInput } from '../types/pipeline.js';
+import { isLocalDevHost, isPrivateHost } from './network-guard.js';
 
 export const COMPARTMENT_TYPES = [
   'AllergyIntolerance',
@@ -44,6 +47,13 @@ export interface PullOptions {
   timeoutMs?: number;
   /** Largest accepted response body per page. Default 50 MB. */
   maxResponseBytes?: number;
+  /**
+   * Allow `iss` hosts that are private / link-local / metadata IP literals (10/8, 172.16/12,
+   * 192.168/16, 169.254/16, fc00::/7, fe80::/10, ...). Off by default; localhost is always allowed.
+   */
+  allowPrivateNetwork?: boolean;
+  /** Totals enforced across ALL pages. Default: FHIRBRIDGE_MAX_INPUT_MB / FHIRBRIDGE_MAX_RESOURCES. */
+  limits?: RuntimeLimits;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }
@@ -61,29 +71,39 @@ export interface PullResult extends LoadedInput {
   skipped: SkippedType[];
 }
 
+/** `auth` = the server refused the credentials; `timeout` = no answer in time; `failed` = anything else. */
+export type FhirPullErrorKind = 'auth' | 'timeout' | 'failed';
+
+/** Messages never contain the server URL (it can embed patient ids and internal host names). */
 export class FhirPullError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    readonly kind: FhirPullErrorKind = status === 401 || status === 403 ? 'auth' : 'failed',
   ) {
     super(message);
     this.name = 'FhirPullError';
   }
 }
 
-export function normalizeBaseUrl(iss: string): URL {
+export function normalizeBaseUrl(iss: string, allowPrivateNetwork = false): URL {
   let url: URL;
   try {
     url = new URL(iss);
   } catch {
-    throw new FhirPullError(`Invalid FHIR base URL: ${iss}`);
+    throw new FhirPullError('Invalid FHIR base URL');
   }
-  const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  const isLocal = isLocalDevHost(url.hostname);
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLocal)) {
     throw new FhirPullError('FHIR base URL must use https (http is allowed only for localhost).');
   }
   if (url.username || url.password) {
     throw new FhirPullError('Credentials in the URL are not allowed; use --token.');
+  }
+  if (!isLocal && !allowPrivateNetwork && isPrivateHost(url.hostname)) {
+    throw new FhirPullError(
+      'FHIR base URL points to a private, loopback or link-local address; pass --allow-private-network to permit it.',
+    );
   }
   url.pathname = url.pathname.replace(/\/+$/, '');
   url.search = '';
@@ -107,11 +127,11 @@ function requestSignal(opts: PullOptions): AbortSignal {
 }
 
 /** Read a response body, aborting as soon as it exceeds `maxBytes`. */
-async function readCapped(res: Response, url: URL, maxBytes: number): Promise<string> {
+async function readCapped(res: Response, maxBytes: number): Promise<string> {
   const declared = Number(res.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
     await res.body?.cancel();
-    throw new FhirPullError(`GET ${url.pathname} response exceeds the ${maxBytes}-byte page limit.`);
+    throw new FhirPullError(`A FHIR response exceeds the ${maxBytes}-byte page limit.`);
   }
   if (!res.body) return '';
   const reader = res.body.getReader();
@@ -124,21 +144,21 @@ async function readCapped(res: Response, url: URL, maxBytes: number): Promise<st
     received += value.byteLength;
     if (received > maxBytes) {
       await reader.cancel();
-      throw new FhirPullError(`GET ${url.pathname} response exceeds the ${maxBytes}-byte page limit.`);
+      throw new FhirPullError(`A FHIR response exceeds the ${maxBytes}-byte page limit.`);
     }
     text += decoder.decode(value, { stream: true });
   }
   return text + decoder.decode();
 }
 
-function describeFailure(url: URL, status: number): string {
+function describeFailure(status: number): string {
   if (status === 401 || status === 403) {
-    return `GET ${url.pathname} was refused (HTTP ${status}): check the access token and its scopes.`;
+    return `The FHIR server refused the request (HTTP ${status}): check the access token and its scopes.`;
   }
   if (status === 408 || status === 429 || status >= 500) {
-    return `GET ${url.pathname} failed with HTTP ${status} (server busy or unavailable); retry later.`;
+    return `The FHIR request failed with HTTP ${status} (server busy or unavailable); retry later.`;
   }
-  return `GET ${url.pathname} failed with HTTP ${status}`;
+  return `The FHIR request failed with HTTP ${status}`;
 }
 
 async function fetchJson(url: URL, opts: PullOptions): Promise<Page> {
@@ -151,24 +171,29 @@ async function fetchJson(url: URL, opts: PullOptions): Promise<Page> {
     res = await doFetch(url, { headers, signal: requestSignal(opts), redirect: 'error' });
     if (!res.ok) {
       await res.body?.cancel();
-      throw new FhirPullError(describeFailure(url, res.status), res.status);
+      throw new FhirPullError(describeFailure(res.status), res.status);
     }
-    text = await readCapped(res, url, opts.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES);
+    text = await readCapped(res, opts.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES);
   } catch (err) {
     if (err instanceof FhirPullError) throw err;
     if (opts.signal?.aborted) throw err;
     if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-      throw new FhirPullError(`GET ${url.pathname} timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms.`);
+      throw new FhirPullError(
+        `A FHIR request timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms.`,
+        undefined,
+        'timeout',
+      );
     }
-    throw new FhirPullError(`GET ${url.pathname} failed: ${err instanceof Error ? err.message : String(err)}`);
+    // The cause (network error text may quote the host) is kept for --debug only.
+    throw Object.assign(new FhirPullError('The FHIR server could not be reached.'), { cause: err });
   }
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    throw new FhirPullError(`GET ${url.pathname} did not return JSON`);
+    throw new FhirPullError('A FHIR response was not valid JSON.');
   }
-  if (!isResource(body)) throw new FhirPullError(`GET ${url.pathname} did not return a FHIR resource`);
+  if (!isResource(body)) throw new FhirPullError('A FHIR response was not a FHIR resource.');
   const bundle: Bundle =
     body.resourceType === 'Bundle' ? (body as Bundle) : { resourceType: 'Bundle', entry: [{ resource: body }] };
   return { bundle, text };
@@ -179,15 +204,34 @@ function nextLink(bundle: Bundle, base: URL): URL | undefined {
   if (!href) return undefined;
   const next = new URL(href, base.origin);
   if (next.origin !== base.origin) {
-    throw new FhirPullError(`Refusing to follow pagination to a different origin (${next.origin}).`);
+    throw new FhirPullError('Refusing to follow pagination to a different origin.');
   }
   return next;
 }
 
+/** Raw page text is never retained: only a running byte count, enforced against the input limits. */
 interface Accumulator {
   entries: InputEntry[];
-  texts: string[];
+  bytes: number;
   pages: number;
+  limits: RuntimeLimits;
+}
+
+function newAccumulator(opts: PullOptions): Accumulator {
+  return { entries: [], bytes: 0, pages: 0, limits: opts.limits ?? loadRuntimeConfig().limits };
+}
+
+function enforceLimits(acc: Accumulator): void {
+  if (acc.bytes > acc.limits.maxInputBytes) {
+    throw new FhirBridgeError('INPUT_TOO_LARGE', 'Pulled data exceeds the configured input size limit.', {
+      hint: 'Raise FHIRBRIDGE_MAX_INPUT_MB, or pull a narrower record.',
+    });
+  }
+  if (acc.entries.length > acc.limits.maxResources) {
+    throw new FhirBridgeError('INPUT_TOO_LARGE', `Pulled data exceeds ${acc.limits.maxResources} resources.`, {
+      hint: 'Raise FHIRBRIDGE_MAX_RESOURCES, or pull a narrower record.',
+    });
+  }
 }
 
 /** Follow `next` links from `first`, collecting entries into `acc`; `maxPages` applies to this call. */
@@ -197,17 +241,18 @@ async function collectPages(first: URL, base: URL, opts: PullOptions, acc: Accum
   let fetched = 0;
   while (url) {
     if (fetched >= maxPages) {
-      throw new FhirPullError(`Stopped after ${maxPages} pages of ${first.pathname} (raise --max-pages).`);
+      throw new FhirPullError(`Stopped after ${maxPages} pages of one query (raise --max-pages).`);
     }
     const page = await fetchJson(url, opts);
     fetched += 1;
     acc.pages += 1;
-    acc.texts.push(page.text);
+    acc.bytes += Buffer.byteLength(page.text, 'utf8') + 1;
     for (const entry of page.bundle.entry ?? []) {
       if (entry.resource && isResource(entry.resource) && entry.resource.resourceType !== 'OperationOutcome') {
         acc.entries.push({ resource: entry.resource, fullUrl: entry.fullUrl });
       }
     }
+    enforceLimits(acc);
     url = nextLink(page.bundle, base);
   }
 }
@@ -221,11 +266,9 @@ function toResult(acc: Accumulator, method: PullResult['method'], skipped: Skipp
     seen.add(key);
     return true;
   });
-  const rawText = acc.texts.join('\n');
   return {
     entries,
-    rawText,
-    bytes: Buffer.byteLength(rawText, 'utf8'),
+    bytes: acc.bytes,
     source: 'bundle',
     method,
     pages: acc.pages,
@@ -240,7 +283,7 @@ function skippableStatus(err: unknown): number | undefined {
 }
 
 async function compartmentSearch(base: URL, opts: PullOptions): Promise<PullResult> {
-  const acc: Accumulator = { entries: [], texts: [], pages: 0 };
+  const acc = newAccumulator(opts);
   const skipped: SkippedType[] = [];
   await collectPages(joinUrl(base, `Patient/${encodeURIComponent(opts.patientId)}`), base, opts, acc);
   for (const type of COMPARTMENT_TYPES) {
@@ -263,8 +306,8 @@ async function compartmentSearch(base: URL, opts: PullOptions): Promise<PullResu
 /** Pull one patient's record from a FHIR R4 server. */
 export async function pullPatient(opts: PullOptions): Promise<PullResult> {
   if (!PATIENT_ID_RE.test(opts.patientId)) throw new FhirPullError('Invalid patient id.');
-  const base = normalizeBaseUrl(opts.iss);
-  const acc: Accumulator = { entries: [], texts: [], pages: 0 };
+  const base = normalizeBaseUrl(opts.iss, opts.allowPrivateNetwork === true);
+  const acc = newAccumulator(opts);
   try {
     const everything = joinUrl(base, `Patient/${encodeURIComponent(opts.patientId)}/$everything`);
     await collectPages(everything, base, opts, acc);

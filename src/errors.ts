@@ -95,6 +95,12 @@ const FS_CODES: Readonly<Record<string, { code: ErrorCode; message: string }>> =
 export function toFhirBridgeError(error: unknown): FhirBridgeError {
   if (isFhirBridgeError(error)) return error;
   const errno = (typeof error === 'object' && error !== null ? error : {}) as ErrnoLike;
+  if (errno.name === 'FhirPullError' && error instanceof Error) {
+    // Duck-typed: importing the SMART client here would create a cycle. Its messages carry no URL.
+    const kind = (error as Error & { kind?: unknown }).kind;
+    const code: ErrorCode = kind === 'auth' ? 'PULL_AUTH' : kind === 'timeout' ? 'PULL_TIMEOUT' : 'PULL_FAILED';
+    return new FhirBridgeError(code, error.message, { cause: error });
+  }
   if (typeof errno.code === 'string') {
     const fs = FS_CODES[errno.code];
     if (fs) return new FhirBridgeError(fs.code, fs.message, { cause: error });

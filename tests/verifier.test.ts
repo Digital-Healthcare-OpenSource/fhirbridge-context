@@ -176,7 +176,7 @@ describe('rehydrate', () => {
       shifts: { 'Patient/a': -10, 'Patient/b': -20 },
       emitted: { 'Patient/a': ['2026-01-15'], 'Patient/b': ['2026-01-15'] },
     });
-    expect(() => rehydrate('2026-01-15', two)).toThrow('Vault holds 2 patients; pass patientKey (--patient Patient/id)');
+    expect(() => rehydrate('2026-01-15', two)).toThrow('Vault holds 2 patients; pass --patient Patient/id.');
     expect(() => new StreamRehydrator(two)).toThrow(/Vault holds 2 patients/);
     expect(rehydrate('2026-01-15', two, { patientKey: 'Patient/b' })).toBe('2026-02-04');
   });

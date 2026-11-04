@@ -7,6 +7,8 @@ import type { Resource } from '../types/fhir.js';
 import { resourceKey } from '../types/fhir.js';
 import type { DecodedDocument, InputEntry, IntegrityWarning } from '../types/pipeline.js';
 import { parseFhirDate } from '../shared/fhir-date.js';
+import { decodeTextBytes } from './charset.js';
+import { collapseWhitespace, stripMarkup, stripRtf } from './markup-strip.js';
 import { rewriteReferences } from './graph-resolver.js';
 
 export const ORIGINAL_ID_URL = 'https://fhirbridge.dev/fhir/StructureDefinition/original-id';
@@ -145,103 +147,15 @@ export function inferLastUpdated(resource: Resource): { resource: Resource; warn
   return { resource };
 }
 
+export { stripMarkup, stripRtf };
+
 /* ------------------------------ text extraction ------------------------------ */
 
-const NAMED_ENTITIES: Readonly<Record<string, string>> = {
-  amp: '&',
-  lt: '<',
-  gt: '>',
-  quot: '"',
-  apos: "'",
-  nbsp: ' ',
-};
-
-function decodeEntities(text: string): string {
-  return text.replace(/&(?:#(\d+)|#x([0-9a-f]+)|([a-z]+));/gi, (match, dec, hex, name) => {
-    const named = typeof name === 'string' ? NAMED_ENTITIES[name.toLowerCase()] : undefined;
-    if (named !== undefined) return named;
-    const cp = dec ? Number(dec) : hex ? parseInt(hex, 16) : Number.NaN;
-    const valid = Number.isInteger(cp) && cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff);
-    return valid ? String.fromCodePoint(cp) : match;
-  });
-}
-
-const collapseWhitespace = (text: string): string => text.replace(/\s+/g, ' ').trim();
-
-export function stripMarkup(markup: string, joinInline = true): string {
-  const stripped = markup
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<[?!][^>]*>/g, ' ')
-    // HTML inline tags glue words together; XML elements always separate them.
-    .replace(joinInline ? /<\/?(?:b|i|u|em|strong|span|font|a|sub|sup|small|big)\b[^>]*>/gi : /(?!)/g, '')
-    .replace(/<[^>]*>/g, ' ');
-  return collapseWhitespace(decodeEntities(stripped));
-}
-
-const RTF_SKIPPED_DESTINATIONS: ReadonlySet<string> = new Set([
-  'fonttbl', 'colortbl', 'stylesheet', 'info', 'pict', 'header', 'footer', 'object', 'themedata',
-  'datastore', 'latentstyles', 'listtable', 'listoverridetable', 'rsidtbl', 'generator',
-]);
-const RTF_BREAK_WORDS: ReadonlySet<string> = new Set(['par', 'line', 'tab', 'row', 'cell', 'sect', 'page']);
-
-export function stripRtf(rtf: string): string {
-  let out = '';
-  let skipping = false;
-  const stack: boolean[] = [];
-  let i = 0;
-  let groupStart = false;
-  while (i < rtf.length) {
-    const ch = rtf.charAt(i);
-    const wasGroupStart = groupStart;
-    groupStart = false;
-    if (ch === '{') {
-      stack.push(skipping);
-      groupStart = true;
-      i += 1;
-    } else if (ch === '}') {
-      skipping = stack.pop() ?? false;
-      i += 1;
-    } else if (ch === '\\') {
-      const next = rtf.charAt(i + 1);
-      if (next === '\\' || next === '{' || next === '}') {
-        if (!skipping) out += next;
-        i += 2;
-      } else if (next === '*') {
-        if (wasGroupStart) skipping = true;
-        i += 2;
-      } else if (next === "'") {
-        const code = parseInt(rtf.slice(i + 2, i + 4), 16);
-        if (!skipping && Number.isFinite(code)) out += String.fromCharCode(code);
-        i += 4;
-      } else {
-        const word = /^\\([a-zA-Z]+)(-?\d+)? ?/.exec(rtf.slice(i, i + 40));
-        if (!word) {
-          i += 2;
-          continue;
-        }
-        const name = word[1] ?? '';
-        if (wasGroupStart && RTF_SKIPPED_DESTINATIONS.has(name)) skipping = true;
-        if (!skipping && RTF_BREAK_WORDS.has(name)) out += ' ';
-        if (!skipping && name === 'u' && word[2]) {
-          const unit = Number(word[2]);
-          out += String.fromCharCode(unit < 0 ? unit + 65536 : unit);
-          i += word[0].length + 1; // skip the single fallback character
-          continue;
-        }
-        i += word[0].length;
-      }
-    } else {
-      if (!skipping && ch !== '\r' && ch !== '\n') out += ch;
-      i += 1;
-    }
-  }
-  return collapseWhitespace(out);
-}
-
-export function extractText(bytes: Buffer, contentType: string): string {
-  const raw = bytes.toString('utf8').replace(/^﻿/, '');
+/** Extract plain text; `null` when the bytes are not really text (see `decodeTextBytes`). */
+export function extractText(bytes: Buffer, contentType: string, rawContentType = contentType): string | null {
+  const decoded = decodeTextBytes(bytes, rawContentType);
+  if (decoded === null) return null;
+  const raw = decoded.replace(/^﻿/, '');
   if (RTF_TYPES.has(contentType)) return stripRtf(raw);
   if (MARKUP_TYPES.has(contentType)) return stripMarkup(raw, contentType === 'text/html');
   return collapseWhitespace(raw);
@@ -322,9 +236,9 @@ function processAttachment(att: Record<string, unknown>, sink: Sink): Record<str
   const contentType = baseType(typeof att['contentType'] === 'string' ? att['contentType'] : undefined);
   const payload = readPayload(data as string);
   const size = payload.bytes.length;
+  const rawType = typeof att['contentType'] === 'string' ? att['contentType'] : '';
 
-  if (payload.validBase64 && TEXT_CONTENT_TYPES.has(contentType)) {
-    recordDocument(sink, contentType, payload);
+  if (payload.validBase64 && TEXT_CONTENT_TYPES.has(contentType) && recordDocument(sink, contentType, rawType, payload)) {
     return { ...rest, size, hash: payload.sha256 };
   }
   const marker = binaryMarker(contentType, size, payload.sha256);
@@ -341,9 +255,9 @@ function processBinary(resource: Resource, sink: Sink): Resource {
   const { data, ...rest } = resource;
   const contentType = baseType(typeof resource['contentType'] === 'string' ? resource['contentType'] : undefined);
   const payload = readPayload(data as string);
+  const rawType = typeof resource['contentType'] === 'string' ? resource['contentType'] : '';
   let info: string;
-  if (payload.validBase64 && TEXT_CONTENT_TYPES.has(contentType)) {
-    recordDocument(sink, contentType, payload);
+  if (payload.validBase64 && TEXT_CONTENT_TYPES.has(contentType) && recordDocument(sink, contentType, rawType, payload)) {
     info = `sha256:${payload.sha256}`;
   } else {
     info = binaryMarker(contentType, payload.bytes.length, payload.sha256);
@@ -356,8 +270,10 @@ function binaryMarker(contentType: string, size: number, sha256: string): string
   return `[BINARY_ATTACHMENT: ${contentType || 'unknown'}, ${size}, sha256:${sha256}]`;
 }
 
-function recordDocument(sink: Sink, contentType: string, payload: Payload): void {
-  const full = extractText(payload.bytes, contentType);
+/** Returns false (nothing recorded) when the bytes turn out not to be text. */
+function recordDocument(sink: Sink, contentType: string, rawType: string, payload: Payload): boolean {
+  const full = extractText(payload.bytes, contentType, rawType);
+  if (full === null) return false;
   const doc: DecodedDocument = {
     resourceKey: sink.key,
     contentType,
@@ -374,6 +290,7 @@ function recordDocument(sink: Sink, contentType: string, payload: Payload): void
     message: `decoded ${contentType} attachment (${payload.bytes.length} bytes, ${full.length} chars)`,
     details: { contentType, sizeBytes: payload.bytes.length, chars: full.length },
   });
+  return true;
 }
 
 function recordStripped(sink: Sink, contentType: string, size: number, payload: Payload): void {

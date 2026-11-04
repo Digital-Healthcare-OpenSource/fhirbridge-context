@@ -187,6 +187,56 @@ describe('MCP server privacy of warnings and rehydration', () => {
   });
 });
 
+describe('MCP model-facing hygiene', () => {
+  it('drops extensions, primitive extensions and attachment hashes from queried resources', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fhirbridge-mcp-'));
+    const hash = 'b'.repeat(64);
+    const path = join(dir, 'in.json');
+    await writeFile(
+      path,
+      JSON.stringify([
+        {
+          resourceType: 'Patient',
+          id: 'p1',
+          name: [{ family: 'Zarbowski', given: ['Quentin'] }],
+          birthDate: '1970-01-02',
+          extension: [{ url: 'http://example.org/ext', valueString: 'ext-marker' }],
+          modifierExtension: [{ url: 'http://example.org/mod', valueString: 'mod-marker' }],
+          _birthDate: {
+            extension: [{ url: 'http://hl7.org/fhir/StructureDefinition/patient-birthTime', valueDateTime: '1970-01-02T08:15:00Z' }],
+          },
+          contained: [{ resourceType: 'Organization', id: 'o', meta: { versionId: '9' }, _name: { extension: [{ url: 'u' }] } }],
+        },
+        {
+          resourceType: 'DocumentReference',
+          id: 'd1',
+          status: 'current',
+          subject: { reference: 'Patient/p1' },
+          content: [{ attachment: { contentType: 'application/pdf', data: Buffer.from('%PDF-1.4\u0000').toString('base64'), hash } }],
+        },
+      ]),
+    );
+    const server = await createMcpServer({ bundlePath: path });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const c = new Client({ name: 'hygiene-test', version: '1.0.0' });
+    await c.connect(clientTransport);
+    try {
+      for (const resourceType of ['Patient', 'DocumentReference']) {
+        const out = textOf(await c.callTool({ name: 'query_patient_resources', arguments: { resourceType } }));
+        for (const forbidden of ['_birthDate', '_name', 'birthTime', 'modifierExtension', 'ext-marker', 'mod-marker', 'versionId', 'sha256', 'BINARY_ATTACHMENT', hash]) {
+          expect(out, `${resourceType}: ${forbidden}`).not.toContain(forbidden);
+        }
+      }
+      const patient = JSON.parse(textOf(await c.callTool({ name: 'query_patient_resources', arguments: { resourceType: 'Patient' } }))) as { birthDate?: string }[];
+      expect(patient[0]?.birthDate).toBeDefined();
+    } finally {
+      await c.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('MCP tool-call logging', () => {
   it('logs tool name, outcome and duration but never arguments or results', async () => {
     const lines: string[] = [];

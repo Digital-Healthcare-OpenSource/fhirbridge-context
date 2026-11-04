@@ -39,6 +39,18 @@ describe('toFhirBridgeError', () => {
     expect(mapped.message).not.toContain('Jane');
   });
 
+  it('maps a FhirPullError by kind and keeps its URL-free message', () => {
+    const make = (kind: string, status?: number) =>
+      Object.assign(new Error('The FHIR request failed'), { name: 'FhirPullError', kind, status });
+    expect(toFhirBridgeError(make('auth', 401))).toMatchObject({ code: 'PULL_AUTH', exitCode: 77 });
+    expect(toFhirBridgeError(make('timeout'))).toMatchObject({ code: 'PULL_TIMEOUT', exitCode: 75 });
+    expect(toFhirBridgeError(make('failed', 500))).toMatchObject({
+      code: 'PULL_FAILED',
+      exitCode: 69,
+      message: 'The FHIR request failed',
+    });
+  });
+
   it('maps aborts and timeouts to PULL_TIMEOUT', () => {
     expect(toFhirBridgeError(new DOMException('x', 'TimeoutError')).code).toBe('PULL_TIMEOUT');
     expect(toFhirBridgeError(new DOMException('x', 'AbortError')).code).toBe('PULL_TIMEOUT');

@@ -11,6 +11,8 @@ const TITLE_WORDS = new Set([
   'mr', 'mrs', 'ms', 'miss', 'mx', 'dr', 'doctor', 'prof', 'professor', 'md', 'do', 'rn', 'np',
   'pa', 'pac', 'phd', 'dds', 'dmd', 'pharmd', 'mbbs',
 ]);
+/** A single Han/Kana/Hangul character is a complete word (a one-character surname such as 李). */
+const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const DIGITS_ONLY: ReadonlySet<PhiCategory> = new Set(['PHONE', 'FAX', 'SSN']);
 const ALNUM_ONLY: ReadonlySet<PhiCategory> = new Set([
   'MRN', 'HEALTH_PLAN', 'ACCOUNT', 'LICENSE', 'VEHICLE', 'DEVICE', 'BIOMETRIC', 'PHOTO', 'ID',
@@ -38,7 +40,7 @@ function computeCanonicalName(raw: string): string {
     .replace(/[^\p{L}\s'-]/gu, ' ')
     .split(/\s+/)
     .map((w) => w.replace(/^['-]+|['-]+$/g, ''))
-    .filter((w) => w.length > 1 && !TITLE_WORDS.has(w));
+    .filter((w) => (w.length > 1 || CJK_CHAR.test(w)) && !TITLE_WORDS.has(w));
   return [...new Set(words)].sort().join(' ');
 }
 

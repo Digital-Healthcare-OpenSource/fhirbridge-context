@@ -1,14 +1,63 @@
-/** Helpers that gather person-name spellings from FHIR resources. */
+/**
+ * Helpers that gather person-name spellings from FHIR resources. Input is untrusted JSON: every
+ * member is type-guarded, so a string where an array belongs ("given": "Quentin") or a nested
+ * array is still collected (and therefore still tokenized) instead of crashing or slipping by.
+ */
 import type { HumanName, Resource } from '../types/fhir.js';
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
+const MAX_DEPTH = 6;
+
+/** String form of a scalar (string / number); undefined for anything else. */
+const scalar = (v: unknown): string | undefined =>
+  typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'bigint' ? String(v) : undefined;
+
+/** All string-ish leaves of a value (scalar, or arrays of them, nested arrays included). */
+export function stringLeaves(v: unknown, depth = 0): string[] {
+  if (depth > MAX_DEPTH) return [];
+  const s = scalar(v);
+  if (s !== undefined) return s.trim() ? [s] : [];
+  return Array.isArray(v) ? v.flatMap((e) => stringLeaves(e, depth + 1)) : [];
+}
+
+/** A HumanName with every member coerced to its documented type (garbage members dropped). */
+function sanitizeName(o: Obj): HumanName {
+  const text = scalar(o.text);
+  const family = scalar(o.family);
+  return {
+    ...(text !== undefined ? { text } : {}),
+    ...(family !== undefined ? { family } : {}),
+    given: stringLeaves(o.given),
+    prefix: stringLeaves(o.prefix),
+    suffix: stringLeaves(o.suffix),
+  };
+}
+
+/** True when an object has the shape of a HumanName (not e.g. Device.deviceName). */
+export function isHumanName(o: unknown): o is HumanName {
+  if (!isObj(o)) return false;
+  if ('family' in o || 'given' in o || 'prefix' in o || 'suffix' in o) return true;
+  return typeof o.text === 'string' && !('system' in o) && !('value' in o) && !('name' in o);
+}
+
+/**
+ * Any `name` shape -> HumanName[]: a HumanName, an array of them, a bare string
+ * ("Quentin Zarbowski"), nested arrays, or numbers. Objects that are not name-like are ignored.
+ */
+export function normalizeNames(v: unknown, depth = 0): HumanName[] {
+  if (depth > MAX_DEPTH) return [];
+  const s = scalar(v);
+  if (s !== undefined) return s.trim() ? [{ text: s.trim() }] : [];
+  if (Array.isArray(v)) return v.flatMap((e) => normalizeNames(e, depth + 1));
+  return isObj(v) ? [sanitizeName(v)] : [];
+}
 
 /** All spellings of the person names in a HumanName[] (for consolidation + text sweeps). */
-export function collectNameVariants(names: HumanName[] | undefined): string[] {
+export function collectNameVariants(names: unknown): string[] {
   const out: string[] = [];
-  for (const n of names ?? []) {
-    const given = (n.given ?? []).filter((g): g is string => typeof g === 'string').join(' ').trim();
+  for (const n of normalizeNames(names)) {
+    const given = (n.given ?? []).join(' ').trim();
     const family = typeof n.family === 'string' ? n.family.trim() : '';
     const full = `${given} ${family}`.trim();
     for (const v of [n.text, full, family && given ? `${family}, ${given}` : '', family, ...(n.given ?? [])]) {
@@ -26,8 +75,7 @@ export function collectAddressTerms(resource: Resource): string[] {
     if (!isObj(value)) return;
     if (key === 'address' || key === 'valueAddress') {
       for (const k of ['city', 'district', 'line'] as const) {
-        const v = value[k];
-        for (const s of Array.isArray(v) ? v : [v]) if (typeof s === 'string' && s.trim()) out.add(s.trim());
+        for (const s of stringLeaves(value[k])) out.add(s.trim());
       }
     }
     for (const [k, v] of Object.entries(value)) visit(v, k);
@@ -36,39 +84,36 @@ export function collectAddressTerms(resource: Resource): string[] {
   return [...out];
 }
 
-/** True when an object has the shape of a HumanName (not e.g. Device.deviceName). */
-export function isHumanName(o: unknown): o is HumanName {
-  if (!isObj(o)) return false;
-  if ('family' in o || 'given' in o || 'prefix' in o || 'suffix' in o) return true;
-  return typeof o.text === 'string' && !('system' in o) && !('value' in o) && !('name' in o);
-}
-
 /**
  * Names nested below the top level of a resource (Patient.contact.name, Organization.contact.name,
  * extension valueHumanName...). Each entry holds the variants of one person.
  */
 export function collectNestedNames(resource: Resource): string[][] {
   const groups: string[][] = [];
+  const add = (v: unknown): void => {
+    const variants = collectNameVariants(v);
+    if (variants.length > 0) groups.push(variants);
+  };
   const visit = (value: unknown, key: string | undefined, depth: number): void => {
+    if (depth > 64) return;
     if (Array.isArray(value)) {
-      const humans = value.filter(isHumanName);
-      if (depth > 1 && (key === 'name' || key === 'valueHumanName') && humans.length > 0) {
-        const variants = collectNameVariants(humans);
-        if (variants.length > 0) groups.push(variants);
+      if (depth > 1 && (key === 'name' || key === 'valueHumanName') && value.some(isHumanName)) {
+        add(value.filter(isHumanName));
         return;
       }
       for (const v of value) visit(v, key, depth);
       return;
     }
     if (!isObj(value)) return;
-    if (/mother.?s?.?maiden/i.test(String(value.url ?? '')) && typeof value.valueString === 'string') {
-      if (value.valueString.trim()) groups.push([value.valueString.trim()]);
+    if (/mother.?s?.?maiden/i.test(String(value.url ?? ''))) {
+      for (const s of stringLeaves(value.valueString)) groups.push([s.trim()]);
     }
     if ((key === 'name' || key === 'valueHumanName') && depth > 1 && isHumanName(value)) {
-      const variants = collectNameVariants([value]);
-      if (variants.length > 0) groups.push(variants);
+      add([value]);
       return;
     }
+    // A bare-string contact name ("contact": [{"name": "Jane Doe"}]) is still a person.
+    if (key === 'contact' && depth > 0 && typeof value.name === 'string') add(value.name);
     for (const [k, v] of Object.entries(value)) visit(v, k, depth + 1);
   };
   visit(resource, undefined, 0);

@@ -8,7 +8,8 @@
  * `fhirbridge/compiler`, `fhirbridge/verifier`.
  */
 import { compile } from './compiler/index.js';
-import { deidentify, SafeHarborVault } from './deid/index.js';
+import { deidentify, SafeHarborVault, type FreeTextMode } from './deid/index.js';
+import { FhirBridgeError } from './errors.js';
 import { loadInput, normalize } from './normalizer/index.js';
 import { estimateTokens } from './shared/token-estimate.js';
 import type {
@@ -23,6 +24,7 @@ import type {
   SafeHarborSummary,
   VaultReader,
 } from './types/pipeline.js';
+import { resourceKey } from './types/fhir.js';
 import { rehydrate, verify } from './verifier/index.js';
 
 export const VERSION = '0.1.0';
@@ -33,8 +35,16 @@ export interface PackOptions {
   /** Vault for reversible tokens and date shifts. */
   vault?: SafeHarborVault;
   format?: ContextFormat;
-  /** Restrict the compiled context to one patient (`Patient/id`). */
+  /**
+   * Restrict the compiled context to one patient (`Patient/id`, the ORIGINAL id or the
+   * pseudonymized one). Throws INPUT_INVALID when no such patient exists.
+   */
   patientKey?: string;
+  /**
+   * Free-text handling when `deid` is on: `scrub` (default, best-effort redaction) or `omit`
+   * (structured data only: all free text and decoded documents are dropped).
+   */
+  freeText?: FreeTextMode;
   now?: Date;
 }
 
@@ -62,20 +72,59 @@ function toGraph(input: LoadedInput | InputEntry[]): NormalizedGraph {
   return normalize(input.entries, { rawText: input.rawText, inputBytes: input.bytes, warnings });
 }
 
+const NO_SUCH_PATIENT =
+  'No such patient in the input (pseudonymized ids are mapped automatically).';
+
+const hasPatient = (graph: NormalizedGraph, key: string): boolean =>
+  graph.resources.some((r) => r.resourceType === 'Patient' && resourceKey(r) === key);
+
+/** Patient key of the ORIGINAL graph for a requested key (original, shortened or already pseudonymized). */
+function originalPatientKey(graph: NormalizedGraph, requested: string): string | undefined {
+  if (hasPatient(graph, requested)) return requested;
+  const shortened = graph.idMap.get(requested);
+  return shortened !== undefined && hasPatient(graph, shortened) ? shortened : undefined;
+}
+
+/**
+ * Patient key to compile for in the (de-identified) output frame. The user may pass the original
+ * id; ids that embed identifiers were pseudonymized, so the vault translates the original id.
+ */
+function resolveRequestedPatient(
+  graph: NormalizedGraph,
+  deid: { graph: NormalizedGraph; vault: SafeHarborVault } | undefined,
+  requested: string,
+): string {
+  if (deid && hasPatient(deid.graph, requested)) return requested; // already the output id
+  const original = originalPatientKey(graph, requested);
+  if (original === undefined) throw new FhirBridgeError('INPUT_INVALID', NO_SUCH_PATIENT);
+  if (!deid || hasPatient(deid.graph, original)) return original;
+  const match = deid.graph.resources.find(
+    (r) => r.resourceType === 'Patient' && deid.vault.originalResourceKey(resourceKey(r)) === original,
+  );
+  if (!match) throw new FhirBridgeError('INPUT_INVALID', NO_SUCH_PATIENT);
+  return resourceKey(match);
+}
+
 /** Layers 1 → 2 → 3 on already-loaded input. */
 export function pack(input: LoadedInput | InputEntry[], opts: PackOptions = {}): PackResult {
   const graph = toGraph(input);
   const format = opts.format ?? 'clinical-md';
   if (!opts.deid) {
-    const context = compile(graph, { format, now: opts.now, patientKey: opts.patientKey });
+    const patientKey = opts.patientKey && resolveRequestedPatient(graph, undefined, opts.patientKey);
+    const context = compile(graph, { format, now: opts.now, patientKey });
     return { context, graph };
   }
   const vault = opts.vault ?? SafeHarborVault.create();
-  const { graph: deidGraph, summary } = deidentify(graph, { vault, now: opts.now });
+  const { graph: deidGraph, summary } = deidentify(graph, {
+    vault,
+    now: opts.now,
+    ...(opts.freeText !== undefined && { freeText: opts.freeText }),
+  });
+  const patientKey = opts.patientKey && resolveRequestedPatient(graph, { graph: deidGraph, vault }, opts.patientKey);
   const context = compile(deidGraph, {
     format,
     now: opts.now,
-    patientKey: opts.patientKey,
+    patientKey,
     safeHarbor: summary,
   });
   return { context, graph, deidGraph, safeHarbor: summary, vault };
@@ -148,6 +197,13 @@ export function verifyResponse(
 }
 
 export { estimateTokens, rehydrate, SafeHarborVault };
+export type { FreeTextMode };
+export { ERROR_CODES, EXIT_CODES, FhirBridgeError, toFhirBridgeError } from './errors.js';
+export type { ErrorCode, FhirBridgeErrorOptions } from './errors.js';
+export { loadRuntimeConfig } from './config.js';
+export type { LogFormat, LogLevel, RuntimeConfig, RuntimeLimits } from './config.js';
+export { createLogger, silentLogger } from './logger.js';
+export type { LogFields, Logger, LoggerOptions } from './logger.js';
 export { compile } from './compiler/index.js';
 export { compileClinicalMarkdown } from './compiler/narrative-compiler.js';
 export { compileViews, toCsv } from './compiler/view-definition.js';

@@ -158,4 +158,49 @@ describe('fhirbridge CLI (built)', () => {
     const bad = run(['doctor'], { FHIRBRIDGE_VAULT_KEY: 'zz' });
     expect(bad.code).toBe(78);
   });
+
+  it('validates --free-text and accepts omit (structured-only)', () => {
+    const bogus = run(['pack', FIXTURE, '--free-text', 'keep']);
+    expect(bogus.code).toBe(64);
+    expect(bogus.stderr).toMatch(/scrub, omit/);
+    const omit = run(['pack', FIXTURE, '--free-text', 'omit']);
+    expect(omit.code).toBe(0);
+    for (const phi of PLANTED_PHI) expect(omit.stdout).not.toContain(phi);
+    expect(run(['mcp', '--help']).stdout).toContain('--free-text');
+    expect(run(['pull', '--help']).stdout).toContain('--free-text');
+  });
+
+  it('validates pull --max-pages as an integer from 1 to 10000', () => {
+    for (const bad of ['0', '-3', 'abc', '2.5', '10001']) {
+      const res = run(['pull', '--iss', 'https://fhir.example.org/r4', '--patient', 'p1', '--max-pages', bad]);
+      expect(res.code, bad).toBe(64);
+    }
+  });
+
+  it('refuses a private-network --iss without echoing the URL (exit 69)', () => {
+    const res = run(['pull', '--iss', 'https://10.9.8.7/secret-path', '--patient', 'p1']);
+    expect(res.code).toBe(69);
+    expect(res.stderr).toMatch(/--allow-private-network/);
+    expect(res.stderr).not.toMatch(/10\.9\.8\.7|secret-path/);
+    expect(run(['pull', '--help']).stdout).toContain('--allow-private-network');
+  });
+
+  it('pack --patient rejects unknown patients (65) and rehydrate needs --patient for multi-patient vaults (64)', async () => {
+    const unknown = run(['pack', FIXTURE, '--patient', 'Patient/does-not-exist']);
+    expect(unknown.code).toBe(65);
+    expect(unknown.stderr).toContain('No such patient in the input');
+
+    const two = join(dir, 'two-patients.ndjson');
+    const patient = (id: string) => JSON.stringify({ resourceType: 'Patient', id, name: [{ family: 'Doe', given: ['Jane'] }], birthDate: '1980-02-03' });
+    await writeFile(two, `${patient('a1')}\n${patient('b2')}\n`);
+    const vault = join(dir, 'two.vault.json');
+    const env = { FHIRBRIDGE_VAULT_PASSPHRASE: PASSPHRASE };
+    expect(run(['pack', two, '--vault', vault, '-o', join(dir, 'two.md')], env).code).toBe(0);
+    const answer = join(dir, 'two-answer.txt');
+    await writeFile(answer, 'Summary for [PATIENT_1] on 2026-01-15.');
+    const res = run(['rehydrate', answer, '--vault', vault], env);
+    expect(res.code).toBe(64);
+    expect(res.stderr).toContain('Vault holds 2 patients; pass --patient Patient/id.');
+    expect(run(['rehydrate', answer, '--vault', vault, '--patient', 'Patient/a1'], env).code).toBe(0);
+  });
 });

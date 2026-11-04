@@ -1,3 +1,4 @@
+import { FhirBridgeError } from '../errors.js';
 import { shiftDatesInText } from '../shared/fhir-date.js';
 import type { RehydrateOptions, VaultReader } from '../types/pipeline.js';
 
@@ -24,7 +25,7 @@ function patientKeyFor(vault: VaultReader, requested?: string): string | undefin
   if (requested) return requested;
   const keys = vault.patientKeys();
   if (keys.length > 1) {
-    throw new Error(`Vault holds ${keys.length} patients; pass patientKey (--patient Patient/id)`);
+    throw new FhirBridgeError('USAGE', `Vault holds ${keys.length} patients; pass --patient Patient/id.`);
   }
   return keys[0];
 }

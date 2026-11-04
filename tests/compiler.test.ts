@@ -409,4 +409,49 @@ describe('compile() formats', () => {
     expect(out.content).toContain('"text":"Metformin 500 MG Oral Tablet"');
     expect(out.content).not.toContain('\n');
   });
+
+  describe('binary attachment markers', () => {
+    const HASH = 'a'.repeat(64);
+    const MARKER = `[BINARY_ATTACHMENT: application/pdf, 6, sha256:${HASH}]`;
+    const withMarkers = () =>
+      buildGraph([
+        patient(),
+        {
+          resourceType: 'DocumentReference',
+          id: 'd1',
+          status: 'current',
+          subject: ref,
+          content: [{ attachment: { contentType: 'application/pdf', size: 6, hash: HASH, title: MARKER } }],
+        },
+        {
+          resourceType: 'Condition',
+          id: 'c1',
+          clinicalStatus: { coding: [{ code: 'active' }] },
+          subject: ref,
+          code: { text: `Scan ${MARKER}` },
+          note: [{ text: `see ${MARKER}` }],
+        },
+      ]);
+
+    it('never prints payload hashes or markers in any format', () => {
+      for (const format of ['clinical-md', 'view-json', 'csv', 'fhir-slim'] as const) {
+        const { content } = compile(withMarkers(), { format, now: NOW });
+        expect(content, format).not.toContain(HASH);
+        expect(content, format).not.toContain('BINARY_ATTACHMENT');
+        expect(content, format).not.toMatch(/sha256/i);
+      }
+    });
+
+    it('shows a neutral placeholder instead', () => {
+      expect(compile(withMarkers(), { format: 'fhir-slim', now: NOW }).content).toContain('[binary attachment omitted]');
+      expect(compile(withMarkers(), { format: 'csv', now: NOW }).content).toContain('Scan [binary attachment omitted]');
+    });
+
+    it('fhir-slim also drops primitive extensions such as _birthDate', () => {
+      const g = buildGraph([patient({ _birthDate: { extension: [{ url: 'u', valueDateTime: '1930-03-05T08:15:00Z' }] } })]);
+      const { content } = compile(g, { format: 'fhir-slim' });
+      expect(content).not.toContain('_birthDate');
+      expect(content).not.toContain('08:15');
+    });
+  });
 });

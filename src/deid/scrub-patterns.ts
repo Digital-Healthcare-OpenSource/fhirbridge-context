@@ -38,6 +38,11 @@ export const ID_RULES: IdRule[] = [
     re: /(?<lab>)(?<v>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24})/g,
     category: 'EMAIL',
   },
+  {
+    // "john at gmail dot com": spelled-out addresses defeat the plain pattern above.
+    re: /(?<lab>)(?<v>\b[A-Za-z0-9._-]{1,40}\s{1,2}(?:at|\[at\]|\(at\))\s{1,2}[A-Za-z0-9-]{1,40}\s{1,2}(?:dot|\[dot\]|\(dot\))\s{1,2}[A-Za-z]{2,10}\b)/gi,
+    category: 'EMAIL',
+  },
   { re: /(?<lab>)(?<v>\b(?:https?:\/\/|www\.)[^\s<>"')\]]+)/gi, category: 'URL', trimTail: true },
   { re: /(?<lab>)(?<v>\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b)/g, category: 'IP' },
   { re: /(?<lab>)(?<v>(?<![\w:])(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}(?![\w:]))/g, category: 'IP' },
@@ -52,9 +57,14 @@ export const ID_RULES: IdRule[] = [
     category: 'MRN',
     dropLabel: true,
   },
+  labelled(
+    String.raw`(?:patient\s{1,2}id|pt\s{1,2}id|MR#|file\s{1,2}(?:no\.?|number|#)|chart(?:\s{1,2}(?:no\.?|number|#))?)`,
+    'MRN',
+  ),
   labelled('NPI', 'ID', String.raw`(?<v>\d{10})\b`),
   labelled(String.raw`(?:acct|account)\s{0,2}(?:no\.?|number|num|#)?`, 'ACCOUNT'),
   labelled(String.raw`(?:member|policy|subscriber|beneficiary|insurance|medicare|medicaid)\s{0,2}(?:id|no\.?|number|#)?`, 'HEALTH_PLAN'),
+  labelled(String.raw`ID(?=[:#\s])`, 'ID'),
   labelled(String.raw`(?:driver'?s?\s{1,2})?licen[sc]e\s{0,2}(?:no\.?|number|#)?`, 'LICENSE'),
   labelled(String.raw`(?:VIN|license plate|plate(?: no\.?| number)?)`, 'VEHICLE'),
   labelled(String.raw`(?:serial(?: no\.?| number| #)?|device id|UDI)`, 'DEVICE'),
@@ -102,37 +112,3 @@ const POSTAL_LABEL = String.raw`(?:post\s?code|postal\s{1,2}code|PLZ|〒|우편�
 const POSTAL_VALUE = String.raw`(?<v>[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}|[A-Z]\d[A-Z]\s?\d[A-Z]\d|\d{3}-\d{4}|\d{4,6})(?![A-Za-z0-9])`;
 export const POSTAL_RE = new RegExp(String.raw`(?<lab>${POSTAL_LABEL}\s{0,2}[:#]?\s{0,2})${POSTAL_VALUE}`, 'gi');
 
-/* ----------------------------------- dates ------------------------------------- */
-
-const MONTH =
-  '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
-export const DATE_PAT = String.raw`(?:\d{4}-\d{2}-\d{2}(?!\d)|\d{1,2}\/\d{1,2}\/\d{4}|${MONTH}\.?\s{1,3}\d{1,2}(?:st|nd|rd|th)?,?\s{1,3}\d{4}|\d{1,2}(?:st|nd|rd|th)?\s{1,3}(?:of\s{1,3})?${MONTH}\.?,?\s{1,3}\d{4})`;
-export const DATE_RE = new RegExp(String.raw`(?<![\d/-])${DATE_PAT}(?![\d/])`, 'gi');
-export const DOB_RE = new RegExp(
-  String.raw`\b(?<lab>(?:DOB|D\.O\.B\.?|date of birth|birth ?date|born(?: on)?)\s{0,3}[:-]?\s{0,3})(?<v>${DATE_PAT})(?![\d/])`,
-  'gi',
-);
-export const AGE_RE =
-  /(?<![\d.])(?<v>(?:9\d|1[0-4]\d))(?<suf>\s{0,2}-?\s{0,2}(?:years?|yrs?)[\s-]{0,3}old\b|\s{0,2}y\/o\b|\s{0,2}y\.o\.|\s{0,2}yo\b)/gi;
-const MONTH_INDEX = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-
-function validIso(y: number, m: number, d: number): string | undefined {
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return undefined;
-  return dt.toISOString().slice(0, 10);
-}
-
-/** Parse ISO, US (M/D/YYYY) and month-name dates to `YYYY-MM-DD`. */
-export function parseAnyDate(s: string): string | undefined {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
-  if (iso) return validIso(Number(iso[1]), Number(iso[2]), Number(iso[3]));
-  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
-  if (us) return validIso(Number(us[3]), Number(us[1]), Number(us[2]));
-  const mon = /([A-Za-z]{3})[A-Za-z]*/.exec(s)?.[1]?.toLowerCase();
-  const nums = s.replace(/[A-Za-z]+/g, ' ').match(/\d+/g);
-  const idx = mon ? MONTH_INDEX.indexOf(mon) : -1;
-  const day = nums?.find((n) => n.length <= 2);
-  const year = nums?.find((n) => n.length === 4);
-  if (idx < 0 || !day || !year) return undefined;
-  return validIso(Number(year), idx + 1, Number(day));
-}

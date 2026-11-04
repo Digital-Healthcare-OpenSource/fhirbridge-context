@@ -9,18 +9,24 @@
  */
 import { readFile, writeFile } from 'node:fs/promises';
 import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
+import {
+  deidOption,
+  formatOption,
+  freeTextOption,
+  MAX_PAGES_LIMIT,
+  noDeidOption,
+  parseMaxPages,
+} from './cli-options.js';
 import { loadRuntimeConfig, type LogFormat } from './config.js';
 import { describeCauses, FhirBridgeError, toFhirBridgeError } from './errors.js';
 import { auditInput, pack, VERSION, type PackResult } from './index.js';
 import { createLogger, type Logger } from './logger.js';
-import { SafeHarborVault } from './deid/index.js';
+import { SafeHarborVault, type FreeTextMode } from './deid/index.js';
 import { runDoctor } from './doctor.js';
 import { loadInput, normalize } from './normalizer/index.js';
 import { pullPatient } from './portability/smart-client.js';
 import type { ContextFormat, IntegrityWarning, LoadedInput } from './types/pipeline.js';
 import { auditCitations, rehydrate } from './verifier/index.js';
-
-const FORMATS: ContextFormat[] = ['clinical-md', 'view-json', 'csv', 'fhir-slim'];
 
 const NO_DEID_WARNING = [
   '!! WARNING: de-identification is OFF (--no-deid).',
@@ -113,22 +119,10 @@ function printPackStats(result: PackResult, vaultPath: string | undefined, ms: n
   err('└');
 }
 
-function parseFormat(value: string): ContextFormat {
-  if (!FORMATS.includes(value as ContextFormat)) {
-    throw new InvalidArgumentError(`Expected one of: ${FORMATS.join(', ')}`);
-  }
-  return value as ContextFormat;
-}
-
-function formatOption(): Option {
-  return new Option('-f, --format <format>', `output format (${FORMATS.join(' | ')})`)
-    .argParser(parseFormat)
-    .default('clinical-md');
-}
-
 interface PackCliOptions {
   /** `--no-deid` sets this to false; anything else means de-identify (the default). */
   deid?: boolean;
+  freeText?: FreeTextMode;
   vault?: string;
   allowKeyFile?: boolean;
   format: ContextFormat;
@@ -145,7 +139,13 @@ async function packAndEmit(loaded: LoadedInput, opts: PackCliOptions): Promise<v
   }
   const start = performance.now();
   const vault = deid ? await openVault(opts.vault, opts.allowKeyFile) : undefined;
-  const result = pack(loaded, { deid, vault, format: opts.format, patientKey: opts.patient });
+  const result = pack(loaded, {
+    deid,
+    vault,
+    format: opts.format,
+    patientKey: opts.patient,
+    freeText: opts.freeText,
+  });
   if (deid && opts.vault && result.vault) await result.vault.save(opts.vault);
   await emit(result.context.content, opts.output);
   printPackStats(result, deid ? opts.vault : undefined, Math.round(performance.now() - start));
@@ -218,18 +218,6 @@ async function runAudit(input: string, opts: { json?: boolean }): Promise<void> 
   );
 }
 
-/** De-identification is the default; this stays accepted (hidden) so existing scripts keep working. */
-function deidOption(): Option {
-  return new Option('--deid', 'de-identify the output (default)').hideHelp();
-}
-
-function noDeidOption(): Option {
-  return new Option(
-    '--no-deid',
-    'DISABLE de-identification: output keeps real names, identifiers and dates (never send it to an external LLM)',
-  );
-}
-
 function addPackCommands(program: Command): void {
   program
     .command('pack')
@@ -238,7 +226,8 @@ function addPackCommands(program: Command): void {
     .addOption(noDeidOption())
     .option('--vault <path>', 'encrypted vault for reversible tokens/date shifts (created if missing)')
     .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
-    .option('--patient <key>', 'only compile this patient (Patient/id)')
+    .option('--patient <key>', 'only compile this patient (Patient/id; the original id works even if it was pseudonymized)')
+    .addOption(freeTextOption())
     .addOption(formatOption())
     .option('-o, --output <path>', 'write context to a file instead of stdout')
     .description('compile a FHIR export into compact clinical context')
@@ -253,23 +242,39 @@ function addPackCommands(program: Command): void {
     .addOption(noDeidOption())
     .option('--vault <path>', 'encrypted vault file')
     .option('--allow-key-file', ALLOW_KEY_FILE_HELP)
-    .option('--max-pages <n>', 'pagination limit per resource type', (v) => Number.parseInt(v, 10), 200)
+    .option('--max-pages <n>', `pagination limit per resource type (1-${MAX_PAGES_LIMIT})`, parseMaxPages, 200)
+    .option(
+      '--allow-private-network',
+      'permit an --iss that is a private, link-local or metadata IP literal (refused by default; localhost is always allowed)',
+    )
+    .addOption(freeTextOption())
     .addOption(formatOption())
     .option('-o, --output <path>', 'write context to a file instead of stdout')
     .description('pull Patient/$everything (or the patient compartment) and pack it')
-    .action(async (opts: PackCliOptions & { iss: string; patient: string; token?: string; maxPages: number }) => {
+    .action(
+      async (
+        opts: PackCliOptions & {
+          iss: string;
+          patient: string;
+          token?: string;
+          maxPages: number;
+          allowPrivateNetwork?: boolean;
+        },
+      ) => {
       const pulled = await pullPatient({
         iss: opts.iss,
         patientId: opts.patient,
         token: opts.token ?? process.env.FHIRBRIDGE_TOKEN,
         maxPages: opts.maxPages,
+        allowPrivateNetwork: opts.allowPrivateNetwork === true,
       });
       err(`Pulled ${pulled.entries.length} resources via ${pulled.method} (${pulled.pages} page(s)).`);
       for (const s of pulled.skipped) {
         err(`WARNING: skipped ${s.type} (HTTP ${s.status}): the server did not serve it, so this record may be incomplete.`);
       }
       await packAndEmit(pulled, { ...opts, patient: undefined });
-    });
+      },
+    );
 }
 
 function addAuditCommands(program: Command): void {
@@ -315,19 +320,29 @@ function addAuditCommands(program: Command): void {
       '--allow-rehydrate',
       'returns REAL PHI to the model — only for models running locally (only tokens the server has shown)',
     )
+    .addOption(freeTextOption())
     .description('start a privacy-by-design MCP server on stdio')
-    .action(async (opts: { bundle: string; vault?: string; allowKeyFile?: boolean; allowRehydrate?: boolean }) => {
+    .action(
+      async (opts: {
+        bundle: string;
+        vault?: string;
+        allowKeyFile?: boolean;
+        allowRehydrate?: boolean;
+        freeText?: FreeTextMode;
+      }) => {
       // Loaded lazily: the MCP SDK is the heaviest dependency and only this command needs it.
       const { runMcpServer } = await import('./mcp/server.js');
       await runMcpServer({
         bundlePath: opts.bundle,
+        freeText: opts.freeText,
         vaultPath: opts.vault,
         passphrase: passphrase(),
         allowKeyFile: opts.allowKeyFile === true,
         allowRehydrate: opts.allowRehydrate === true,
         logger: log,
       });
-    });
+      },
+    );
 }
 
 function parseLogFormat(value: string): LogFormat {

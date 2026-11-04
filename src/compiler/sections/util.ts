@@ -103,14 +103,23 @@ export function dayOf(value: string | undefined): string | undefined {
   return value === undefined ? undefined : value.slice(0, 10);
 }
 
+/** `[BINARY_ATTACHMENT: type, size, sha256:...]` markers written by the normalizer. */
+export const BINARY_MARKER_RE = /\[BINARY_ATTACHMENT[^\]]*\]/;
+export const BINARY_OMITTED = '[binary attachment omitted]';
+
+/** Replace binary-attachment markers (which embed a payload hash) before text reaches a model. */
+export function hideBinaryMarkers(value: string): string {
+  return value.replace(new RegExp(BINARY_MARKER_RE.source, 'g'), BINARY_OMITTED);
+}
+
 export function oneLine(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, ' ').trim();
+  const flat = hideBinaryMarkers(value).replace(/\s+/g, ' ').trim();
   return flat.length <= max ? flat : `${flat.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
 }
 
 /** Escape a value for a markdown table cell. */
 export function cell(value: string): string {
-  return value.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+  return hideBinaryMarkers(value).replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
 }
 
 /** Best clinical date of a resource (raw FHIR date string). */

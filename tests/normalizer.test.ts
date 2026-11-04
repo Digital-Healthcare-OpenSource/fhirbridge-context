@@ -346,3 +346,41 @@ describe('file loading', () => {
     await expect(loadInput(empty)).rejects.toMatchObject({ code: 'INPUT_INVALID' });
   });
 });
+
+describe('attachment charsets and binary detection', () => {
+  const docRef = (contentType: string, bytes: Buffer): Resource => ({
+    resourceType: 'DocumentReference',
+    id: 'd1',
+    status: 'current',
+    content: [{ attachment: { contentType, data: bytes.toString('base64') } }],
+  });
+  const NOTE = 'Quentin Zarbowski has hypertension.';
+
+  it('decodes utf-16le, utf-16be, latin1 and BOM-marked payloads', () => {
+    const be = Buffer.from(Buffer.from(NOTE, 'utf16le').swap16());
+    const cases: [string, Buffer][] = [
+      ['text/plain; charset=utf-16le', Buffer.from(NOTE, 'utf16le')],
+      ['text/plain; charset="UTF-16BE"', be],
+      ['text/plain', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(NOTE, 'utf16le')])],
+      ['text/plain', Buffer.concat([Buffer.from([0xfe, 0xff]), be])],
+      ['text/plain', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(NOTE, 'utf8')])],
+      ['text/plain; charset=iso-8859-1', Buffer.from(NOTE, 'latin1')],
+    ];
+    for (const [type, bytes] of cases) {
+      const { documents } = decodeAttachments(docRef(type, bytes));
+      expect(documents[0]?.text, type).toBe(NOTE);
+    }
+    const accents = decodeAttachments(docRef('text/plain; charset=windows-1252', Buffer.from('Müller café', 'latin1')));
+    expect(accents.documents[0]?.text).toBe('Müller café');
+  });
+
+  it('treats undecodable text payloads as binary: marker and warning, no document', () => {
+    const undeclaredUtf16 = Buffer.from(NOTE, 'utf16le'); // NULs once read as UTF-8
+    const garbage = Buffer.from(Array.from({ length: 200 }, (_, i) => 0x80 + (i % 40)));
+    for (const bytes of [undeclaredUtf16, garbage]) {
+      const out = decodeAttachments(docRef('text/plain', bytes));
+      expect(out.documents).toHaveLength(0);
+      expect(out.warnings.map((w) => w.code)).toEqual(['BINARY_ATTACHMENT_STRIPPED']);
+    }
+  });
+});

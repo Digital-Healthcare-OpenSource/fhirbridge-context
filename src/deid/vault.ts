@@ -64,6 +64,7 @@ interface VaultState {
   windows: [string, { min: string; max: string }][];
   emitted?: [string, string[]][];
   ids?: [string, string][];
+  bindings?: [string, string][];
 }
 
 export class SafeHarborVault implements VaultReader {
@@ -75,6 +76,8 @@ export class SafeHarborVault implements VaultReader {
   private readonly windows = new Map<string, { min: string; max: string }>();
   private readonly emitted = new Map<string, Set<string>>();
   private readonly ids = new Map<string, string>();
+  /** patientKey -> shift key of its most recent canonical binding. */
+  private readonly bindings = new Map<string, string>();
   private filePath?: string;
   private kdf: Kdf = 'raw';
   private salt?: Buffer;
@@ -152,6 +155,7 @@ export class SafeHarborVault implements VaultReader {
       windows: [...this.windows],
       emitted: [...this.emitted].map(([k, v]) => [k, [...v].sort()]),
       ids: [...this.ids],
+      bindings: [...this.bindings],
     };
   }
 
@@ -163,6 +167,7 @@ export class SafeHarborVault implements VaultReader {
     for (const [k, v] of state.windows) this.windows.set(k, v);
     for (const [k, v] of state.emitted ?? []) this.emitted.set(k, new Set(v));
     for (const [k, v] of state.ids ?? []) this.ids.set(k, v);
+    for (const [k, v] of state.bindings ?? []) this.bindings.set(k, v);
   }
 
   /* -------------------------------- tokens --------------------------------- */
@@ -243,45 +248,80 @@ export class SafeHarborVault implements VaultReader {
     return -((digest.readUInt32BE(0) % SHIFT_SPAN) + SHIFT_MIN_ABS);
   }
 
+  /**
+   * Shifts, emitted dates and windows are stored per (patientKey, canonical id): the same
+   * `Patient/p1` arriving with a different canonical id is a different person and gets its own
+   * offset and its own emitted-date record. The reader methods below take the plain `patientKey`
+   * and resolve it to the MOST RECENT canonical binding made for that key in this vault.
+   */
+  private shiftKey(patientKey: string, canonicalId: string): string {
+    const tag = createHmac('sha256', this.keys.hmac).update(`DATE_SHIFT_KEY:${canonicalId}`).digest('hex');
+    return `${patientKey}#${tag.slice(0, ID_HASH_CHARS)}`;
+  }
+
+  /** Store key for a patient: the latest binding, else a pre-binding legacy entry keyed by itself. */
+  private resolveShiftKey(patientKey: string): string | undefined {
+    const bound = this.bindings.get(patientKey);
+    if (bound !== undefined) return bound;
+    return this.shifts.has(patientKey) ? patientKey : undefined;
+  }
+
   assignDateShift(patientKey: string, canonicalId: string): number {
-    const existing = this.shifts.get(patientKey);
-    if (existing !== undefined) return existing;
-    const days = this.computeShift(canonicalId);
-    this.shifts.set(patientKey, days);
+    const key = this.shiftKey(patientKey, canonicalId);
+    let days = this.shifts.get(key);
+    if (days === undefined) {
+      days = this.computeShift(canonicalId);
+      this.shifts.set(key, days);
+      this.adoptLegacyEmitted(patientKey, key, days);
+    }
+    this.bindings.set(patientKey, key);
     return days;
   }
 
+  /** A vault written before canonical binding keyed its record by the plain patient key. */
+  private adoptLegacyEmitted(patientKey: string, key: string, days: number): void {
+    if (this.shifts.get(patientKey) !== days) return;
+    const dates = this.emitted.get(patientKey);
+    if (dates) this.emitted.set(key, new Set(dates));
+    const window = this.windows.get(patientKey);
+    if (window) this.windows.set(key, { ...window });
+  }
+
   dateShiftDaysFor(patientKey: string): number | undefined {
-    return this.shifts.get(patientKey);
+    const key = this.resolveShiftKey(patientKey);
+    return key === undefined ? undefined : this.shifts.get(key);
   }
 
   dateShifts(): ReadonlyMap<string, number> {
-    return new Map(this.shifts);
+    return new Map(this.patientKeys().map((k) => [k, this.dateShiftDaysFor(k) ?? 0]));
   }
 
   patientKeys(): string[] {
-    return [...this.shifts.keys()];
+    const keys = new Set(this.bindings.keys());
+    for (const k of this.shifts.keys()) if (!k.includes('#')) keys.add(k);
+    return [...keys];
   }
 
   /** Record a SHIFTED date emitted for a patient (first 10 chars, YYYY-MM-DD). */
   recordShiftedDate(patientKey: string, isoDate: string): void {
     const day = isoDate.slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
-    const set = this.emitted.get(patientKey) ?? new Set<string>();
+    const key = this.resolveShiftKey(patientKey) ?? patientKey;
+    const set = this.emitted.get(key) ?? new Set<string>();
     set.add(day);
-    this.emitted.set(patientKey, set);
-    const w = this.windows.get(patientKey);
-    if (!w) this.windows.set(patientKey, { min: day, max: day });
-    else this.windows.set(patientKey, { min: day < w.min ? day : w.min, max: day > w.max ? day : w.max });
+    this.emitted.set(key, set);
+    const w = this.windows.get(key);
+    if (!w) this.windows.set(key, { min: day, max: day });
+    else this.windows.set(key, { min: day < w.min ? day : w.min, max: day > w.max ? day : w.max });
   }
 
   shiftedDateWindow(patientKey: string): { min: string; max: string } | undefined {
-    const w = this.windows.get(patientKey);
+    const w = this.windows.get(this.resolveShiftKey(patientKey) ?? patientKey);
     return w ? { ...w } : undefined;
   }
 
   emittedShiftedDates(patientKey: string): ReadonlySet<string> {
-    return new Set(this.emitted.get(patientKey) ?? []);
+    return new Set(this.emitted.get(this.resolveShiftKey(patientKey) ?? patientKey) ?? []);
   }
 
   /* ------------------------------ resource ids ------------------------------ */

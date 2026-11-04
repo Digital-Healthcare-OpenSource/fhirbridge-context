@@ -1,9 +1,10 @@
 /**
  * Clinical free-text scrubber (HIPAA Safe Harbor).
  *
- * Pipeline: protect clinical fractions -> structured identifiers -> addresses/postal codes ->
- * DOB / age>89 -> dates -> names -> restore. Medical eponyms, devices, specialties and drug
- * names are never treated as person names unless the name is registered from structured data.
+ * Pipeline: protect clinical fractions -> neutralize literal tokens -> structured identifiers ->
+ * addresses/postal codes -> birth cues / ages > 89 / dates -> own identifiers + digit runs ->
+ * names -> restore. Medical eponyms, devices, specialties and drug names are never treated as
+ * person names unless the name is registered from structured data.
  * PRIVACY CRITICAL: when unsure about a PHI-shaped value, remove it.
  *
  * Without a date shift (no `dateShiftDays` and no shift registered for `patientKey`) dates
@@ -11,23 +12,18 @@
  * birth date is ALWAYS reduced to its year (or "90+" when older than 89).
  */
 import { generalizeZip } from '../dictionaries/hipaa-zip3.js';
-import { ageInYears, shiftFhirDate } from '../shared/fhir-date.js';
-import { AGE_CAP_LABEL } from './date-shifter.js';
-import {
-  ADDRESS_RE,
-  AGE_RE,
-  DATE_RE,
-  DOB_RE,
-  FRACTION_RES,
-  ID_RULES,
-  POSTAL_RE,
-  ZIP_RES,
-  parseAnyDate,
-} from './scrub-patterns.js';
+import { ADDRESS_RE, FRACTION_RES, ID_RULES, POSTAL_RE, ZIP_RES } from './scrub-patterns.js';
+import { scrubIdentifiers } from './scrub-identifiers.js';
 import { scrubNames } from './scrub-names.js';
-import { Shield, bump, type Acc, type Run, type ScrubContext, type ScrubResult } from './scrub-types.js';
+import { PH_CLOSE, PH_OPEN, Shield, bump, type Acc, type Run, type ScrubContext, type ScrubResult } from './scrub-types.js';
+import { applyAges, applyBirthCues, applyTextDates } from './text-dates.js';
 
 export type { KnownName, ScrubContext, ScrubResult } from './scrub-types.js';
+
+/** Input must never carry the private-use delimiters the Shield uses for held output. */
+const PLACEHOLDER_CHARS_RE = new RegExp(`[${PH_OPEN}${PH_CLOSE}]`, 'g');
+/** A `[CATEGORY_n]` already present in SOURCE text must never be mistaken for a vault token. */
+const LITERAL_TOKEN_RE = /\[([A-Z][A-Z_]*_\d+)\]/g;
 
 /* ---------------------------- structured identifiers --------------------------- */
 
@@ -74,36 +70,6 @@ function applyAddressAndZip(text: string, run: Run): string {
   return out;
 }
 
-/* ----------------------------------- dates ------------------------------------- */
-
-function shiftedDateText(iso: string, run: Run): string {
-  if (run.days === undefined) return iso.slice(0, 4);
-  const shifted = shiftFhirDate(iso, run.days);
-  run.acc.datesShifted += 1;
-  if (run.ctx.patientKey) run.ctx.vault.recordShiftedDate(run.ctx.patientKey, shifted);
-  return shifted;
-}
-
-function applyDobAndDates(text: string, run: Run): string {
-  let out = text.replace(DOB_RE, (...args: unknown[]) => {
-    const groups = args[args.length - 1] as { lab: string; v: string };
-    const iso = parseAnyDate(groups.v);
-    if (!iso) return args[0] as string;
-    const age = ageInYears(iso, run.now);
-    // Safe Harbor: a birth date keeps only its year, and nothing at all above age 89.
-    const replacement = age !== undefined && age > 89 ? AGE_CAP_LABEL : iso.slice(0, 4);
-    return `${groups.lab}${run.shield.hold(replacement)}`;
-  });
-  out = out.replace(AGE_RE, (...args: unknown[]) => {
-    const groups = args[args.length - 1] as { suf: string };
-    return run.shield.hold(`${AGE_CAP_LABEL}${groups.suf}`);
-  });
-  return out.replace(DATE_RE, (m) => {
-    const iso = parseAnyDate(m);
-    return iso ? run.shield.hold(shiftedDateText(iso, run)) : m;
-  });
-}
-
 /* ------------------------------------ entry ------------------------------------ */
 
 export function scrubText(text: string, ctx: ScrubContext): ScrubResult {
@@ -112,11 +78,14 @@ export function scrubText(text: string, ctx: ScrubContext): ScrubResult {
   const days =
     ctx.dateShiftDays ?? (ctx.patientKey ? ctx.vault.dateShiftDaysFor(ctx.patientKey) : undefined);
   const run: Run = { ctx, acc, shield, now: ctx.now ?? new Date(), days };
-  let t = text.replace(/[]/g, '');
+  let t = text.replace(PLACEHOLDER_CHARS_RE, '').replace(LITERAL_TOKEN_RE, '($1)');
   for (const re of FRACTION_RES) t = t.replace(re, (m) => shield.hold(m));
   t = applyIdRules(t, run);
   t = applyAddressAndZip(t, run);
-  t = applyDobAndDates(t, run);
+  t = applyBirthCues(t, run);
+  t = applyAges(t, run);
+  t = applyTextDates(t, run);
+  t = scrubIdentifiers(t, run);
   t = scrubNames(t, run);
   return { text: shield.restore(t), ...acc };
 }

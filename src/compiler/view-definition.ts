@@ -6,6 +6,7 @@ import { medInfo } from './sections/medications.js';
 import {
   ageAtDeidentification,
   findCoding,
+  hideBinaryMarkers,
   inScope,
   rec,
   str,
@@ -82,7 +83,8 @@ function firstValue(resource: unknown, path: string): unknown {
 }
 
 function scalar(value: unknown): Scalar {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' ? value : null;
+  if (typeof value === 'string') return hideBinaryMarkers(value);
+  return typeof value === 'number' || typeof value === 'boolean' ? value : null;
 }
 
 function callFunction(name: string, arg: string, ec: EvalCtx): Scalar {

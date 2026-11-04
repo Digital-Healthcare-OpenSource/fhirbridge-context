@@ -11,7 +11,6 @@
 import { createReadStream } from 'node:fs';
 import { lstat, readFile, readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { loadRuntimeConfig, type RuntimeLimits } from '../config.js';
 import { FhirBridgeError } from '../errors.js';
 import type { Resource } from '../types/fhir.js';
@@ -19,6 +18,10 @@ import { isResource } from '../types/fhir.js';
 import type { InputEntry, IntegrityWarning, LoadedInput } from '../types/pipeline.js';
 
 const MAX_BUNDLE_DEPTH = 8;
+/** A single NDJSON line larger than this is rejected without buffering the rest of it. */
+export const MAX_LINE_BYTES = 64 * 1024 * 1024;
+/** Maximum JSON container nesting accepted (deeper input would overflow recursive consumers). */
+const MAX_JSON_DEPTH = 256;
 const LOADABLE_EXTENSIONS: ReadonlySet<string> = new Set(['.json', '.ndjson']);
 /** Keys that could reach an object prototype if a consumer ever merged parsed JSON naively. */
 const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
@@ -36,12 +39,42 @@ function invalid(message: string): IntegrityWarning {
   return { code: 'INVALID_RESOURCE', resourceKey: '(input)', message };
 }
 
-/** JSON.parse that drops prototype-polluting keys and never surfaces input text in errors. */
+/** True when `[`/`{` nesting exceeds the limit (string contents are skipped). */
+function exceedsDepth(text: string): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text.charCodeAt(i);
+    if (inString) {
+      if (ch === 0x5c) i += 1;
+      else if (ch === 0x22) inString = false;
+    } else if (ch === 0x22) {
+      inString = true;
+    } else if (ch === 0x5b || ch === 0x7b) {
+      depth += 1;
+      if (depth > MAX_JSON_DEPTH) return true;
+    } else if (ch === 0x5d || ch === 0x7d) {
+      depth -= 1;
+    }
+  }
+  return false;
+}
+
+function tooDeep(): FhirBridgeError {
+  return new FhirBridgeError('INPUT_INVALID', 'Input nesting is too deep.');
+}
+
+/**
+ * JSON.parse that drops prototype-polluting keys and never surfaces input text in errors.
+ * Throws INPUT_INVALID for pathological nesting instead of a RangeError.
+ */
 function safeJson(text: string): { ok: true; value: unknown } | { ok: false } {
+  if (exceedsDepth(text)) throw tooDeep();
   try {
     const value: unknown = JSON.parse(text, (key, v: unknown) => (FORBIDDEN_KEYS.has(key) ? undefined : v));
     return { ok: true, value };
-  } catch {
+  } catch (error) {
+    if (error instanceof RangeError) throw tooDeep();
     return { ok: false };
   }
 }
@@ -138,17 +171,51 @@ class Budget {
   }
 }
 
+/** Split a byte stream into lines, aborting as soon as one line exceeds `maxLineBytes`. */
+async function* readLines(
+  stream: AsyncIterable<Buffer>,
+  budget: Budget,
+  maxLineBytes: number = MAX_LINE_BYTES,
+): AsyncGenerator<string> {
+  let pending: Buffer[] = [];
+  let pendingBytes = 0;
+  const push = (piece: Buffer): void => {
+    pendingBytes += piece.length;
+    if (pendingBytes > maxLineBytes) {
+      throw new FhirBridgeError('INPUT_TOO_LARGE', `An NDJSON line exceeds ${formatMb(maxLineBytes)}.`, {
+        hint: 'Single resources this large are not supported; split the export or strip the attachment.',
+      });
+    }
+    pending.push(piece);
+  };
+  const flush = (): string => {
+    const line = Buffer.concat(pending).toString('utf8').replace(/\r$/, '');
+    pending = [];
+    pendingBytes = 0;
+    return line;
+  };
+  for await (const chunk of stream) {
+    budget.addBytes(chunk.length);
+    let from = 0;
+    for (let nl = chunk.indexOf(0x0a, from); nl !== -1; nl = chunk.indexOf(0x0a, from)) {
+      push(chunk.subarray(from, nl));
+      yield flush();
+      from = nl + 1;
+    }
+    if (from < chunk.length) push(chunk.subarray(from));
+  }
+  if (pendingBytes > 0) yield flush();
+}
+
 async function loadNdjsonStream(path: string, budget: Budget): Promise<LoadedInputWithWarnings> {
   const warnings: IntegrityWarning[] = [];
   const entries: InputEntry[] = [];
-  const stream = createReadStream(path, { encoding: 'utf8' });
-  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  const stream = createReadStream(path);
   const start = budget.bytes;
   let lineNo = 0;
   try {
-    for await (const rawLine of lines) {
+    for await (const rawLine of readLines(stream, budget)) {
       lineNo += 1;
-      budget.addBytes(Buffer.byteLength(rawLine, 'utf8') + 1);
       const line = lineNo === 1 ? rawLine.replace(/^﻿/, '') : rawLine;
       if (!line.trim()) continue;
       const parsed = safeJson(line);
@@ -161,7 +228,6 @@ async function loadNdjsonStream(path: string, budget: Budget): Promise<LoadedInp
       entries.push(...expanded);
     }
   } finally {
-    lines.close();
     stream.destroy();
   }
   if (entries.length === 0 && warnings.length === 0) {

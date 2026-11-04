@@ -35,9 +35,21 @@ First release.
   PHI-safe structured logging, distroless non-root container image, CI (Ubuntu/Windows × Node
   22/24, e2e, coverage, Docker, npm-pack check), CodeQL, Dependabot, provenance-signed releases.
 
+- **Structured-only mode**: `--free-text omit` (CLI `pack`/`pull`/`mcp`, SDK `freeText: 'omit'`)
+  drops every free-text field and decoded document, leaving only coded, de-identified data. This
+  is the recommended mode for real patient data.
+
 ### Security
 
-- Fixed before release, found by independent review: the date-shift offset in the compiled
+- Fixed before release, found by a second independent red-team review: PHI passing through
+  non-conformant JSON types (numeric identifiers and ZIPs, string `name`/`line`); base64 payloads
+  without a content type; the patient's own unlabelled identifiers in notes; uncommon date
+  formats, DOB cues and age phrasings over 89; resource ids embedding dates or phone numbers
+  (an offset oracle); birth-time extensions; UTF-16 notes decoded as UTF-8; other patients'
+  names in a multi-patient bundle; PHI in code, system, unit and url members; date offsets
+  shared across datasets in one vault; uncapped `Age` values; unbounded or URL-echoing `pull`
+  errors; attachment hashes shown to the model.
+- Fixed before release, found by the first independent review: the date-shift offset in the compiled
   header, raw normalizer warnings in model-facing output, unparseable dates passed through
   unshifted, uncovered structured fields and extensions, patient surnames treated as eponyms,
   diacritic and apostrophe variants of names, unregistered relatives' names, ReDoS in the

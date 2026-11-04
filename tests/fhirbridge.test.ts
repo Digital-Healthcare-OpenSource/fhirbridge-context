@@ -203,8 +203,31 @@ describe('FHIRBridge end-to-end', () => {
   it('test_rehydration_requires_a_patient_when_the_vault_holds_several', () => {
     const vault = SafeHarborVault.create({ masterKey: MASTER_KEY });
     pack(entries(patient('p1'), patient('p2')), { deid: true, vault, now: NOW });
-    expect(() => rehydrate('on 2026-01-15', vault)).toThrow(/Vault holds 2 patients; pass patientKey/);
+    expect(() => rehydrate('on 2026-01-15', vault)).toThrow(
+      expect.objectContaining({ code: 'USAGE', message: 'Vault holds 2 patients; pass --patient Patient/id.' }),
+    );
     expect(() => rehydrate('on 2026-01-15', vault, { patientKey: 'Patient/p1' })).not.toThrow();
+  });
+
+  it('test_pack_patient_filter_rejects_unknown_patients_and_accepts_original_ids', () => {
+    const input = entries(patient('p1'), patient('p2'));
+    expect(() => pack(input, { patientKey: 'Patient/nope' })).toThrow(
+      expect.objectContaining({
+        code: 'INPUT_INVALID',
+        message: 'No such patient in the input (pseudonymized ids are mapped automatically).',
+      }),
+    );
+    expect(() => pack(input, { deid: true, patientKey: 'Patient/nope', now: NOW })).toThrow(
+      expect.objectContaining({ code: 'INPUT_INVALID' }),
+    );
+    // An id that embeds a digit run is pseudonymized in the output; the ORIGINAL id still selects it.
+    const identifying = entries(patient('MRN-4471902'), patient('p2'));
+    const vault = SafeHarborVault.create({ masterKey: MASTER_KEY });
+    const scoped = pack(identifying, { deid: true, vault, now: NOW, patientKey: 'Patient/MRN-4471902' });
+    expect(scoped.deidGraph?.resources.some((r) => r.id === 'MRN-4471902')).toBe(false);
+    expect(scoped.context.content).not.toContain('4471902');
+    expect(scoped.context.content).toMatch(/\[Patient\/patient-[0-9a-f]+\]/);
+    expect(scoped.context.content).not.toContain('Patient/p2');
   });
 
   it('test_verify_maps_pseudonymized_citation_ids_back_with_the_vault', async () => {

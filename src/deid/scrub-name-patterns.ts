@@ -22,8 +22,18 @@ const NAME_WORD = String.raw`\p{Lu}[\p{L}'’-]{0,40}`;
 export const NAME_PAT = String.raw`(?:${NAME_WORD},\s{1,3}${NAME_WORD}(?:\s{1,3}\p{Lu}\.)?|${NAME_WORD}(?:\s{1,3}(?:\p{Lu}\.(?=\s)|${NAME_WORD})){0,2})`;
 const NAME_PAT_LONG = String.raw`${NAME_WORD}(?:\s{1,3}${NAME_WORD}){0,3}`;
 
+/** Capitalized stop words that are also common given names ("Nguyen Van An"). */
+export const NAME_LIKE_STOP_WORDS: ReadonlySet<string> = new Set(['an']);
+/** Foreign / generic honorifics: the name behind them is a person, not necessarily a provider. */
+export const PERSON_TITLES: ReadonlySet<string> = new Set(['sr', 'sra', 'frau', 'herr', 'mme', 'm']);
+
 export const TITLE_CUE_RE = new RegExp(
-  String.raw`(?<pre>\b(?<cue>${['Dr', 'Doctor', 'Mrs', 'Mr', 'Ms', 'Miss', 'Professor', 'Prof'].map(ci).join('|')})\b\.?[ \t]{0,3})(?<name>${NAME_PAT})`,
+  String.raw`(?<pre>\b(?<cue>${[...['Dr', 'Doctor', 'Mrs', 'Mr', 'Ms', 'Miss', 'Professor', 'Prof', 'Sr', 'Sra', 'Frau', 'Herr', 'Mme'].map(ci), String.raw`M(?=\.)`].join('|')})\b\.?[ \t]{0,3})(?<name>${NAME_PAT})`,
+  'gu',
+);
+/** "Name: Bob Smith" (a colon is required: "Name" alone is an ordinary word). */
+export const LABEL_CUE_RE = new RegExp(
+  String.raw`(?<pre>\b(?<cue>${ci('Name')})[ \t]{0,2}:[ \t]{0,3})(?<name>${NAME_PAT})`,
   'gu',
 );
 const BY_VERBS =
@@ -50,9 +60,12 @@ const RELATION_CUES = [
   'brother', 'sister', 'sibling', 'aunt', 'uncle', 'cousin', 'grandson', 'granddaughter',
   'grandmother', 'grandfather', 'neighbor', 'neighbour', 'friend', 'caregiver', 'guardian',
   'fiancé', 'fiancée', 'fiance', 'fiancee', 'niece', 'nephew', 'stepson', 'stepdaughter',
+  'named', 'next of kin', 'NOK', 'emergency contact', 'guarantor', 'contact', 'reviewed with',
+  'discussed with',
 ];
+const phrase = (p: string): string => p.split(' ').map(ci).join(String.raw`\s{1,2}`);
 export const RELATION_CUE_RE = new RegExp(
-  String.raw`(?<pre>(?<![\p{L}])(?<cue>${RELATION_CUES.map(ci).join('|')})(?:['’]s)?(?![\p{L}])[ \t]{0,3}[:,-]?[ \t]{0,3})(?<name>${NAME_PAT})`,
+  String.raw`(?<pre>(?<![\p{L}])(?<cue>${RELATION_CUES.map(phrase).join('|')})(?:['’]s)?(?![\p{L}])[ \t]{0,3}[:,-]?[ \t]{0,3})(?<name>${NAME_PAT})`,
   'gu',
 );
 

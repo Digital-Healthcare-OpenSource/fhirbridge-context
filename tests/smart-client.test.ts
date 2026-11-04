@@ -1,5 +1,6 @@
 /** SMART-on-FHIR pull against a fake FHIR server (no network). */
 import { describe, expect, it } from 'vitest';
+import { toFhirBridgeError } from '../src/errors.js';
 import { FhirPullError, normalizeBaseUrl, pullPatient } from '../src/portability/smart-client.js';
 
 const BASE = 'https://fhir.example.org/r4';
@@ -179,5 +180,89 @@ describe('pullPatient', () => {
     expect(() => normalizeBaseUrl('https://user:pw@fhir.example.org')).toThrow(/Credentials/);
     expect(normalizeBaseUrl('http://localhost:8080/fhir/').toString()).toBe('http://localhost:8080/fhir');
     await expect(pullPatient({ iss: BASE, patientId: '../../admin' })).rejects.toThrow(/Invalid patient id/);
+  });
+
+  it('never echoes the URL in an error message', async () => {
+    const secretBase = 'https://internal-his.corp.example/fhir-secret-path';
+    for (const status of [404, 401, 500]) {
+      const { fetch } = fakeFetch(() => ({ status, body: {} }));
+      const failure = await pullPatient({ iss: secretBase, patientId: 'p1', fetchImpl: fetch }).catch((e: unknown) => e);
+      expect((failure as Error).message).not.toMatch(/internal-his|fhir-secret-path|p1/);
+    }
+    expect(() => normalizeBaseUrl('not a url with secret-token')).toThrow(
+      expect.objectContaining({ message: 'Invalid FHIR base URL' }),
+    );
+    const network = (async () => {
+      throw new TypeError('fetch failed: getaddrinfo ENOTFOUND internal-his.corp.example');
+    }) as unknown as typeof fetch;
+    const failure = await pullPatient({ iss: secretBase, patientId: 'p1', fetchImpl: network }).catch((e: unknown) => e);
+    expect((failure as Error).message).not.toContain('internal-his');
+    expect(toFhirBridgeError(failure).code).toBe('PULL_FAILED');
+  });
+
+  it('maps pull failures to PULL_AUTH, PULL_TIMEOUT and PULL_FAILED', async () => {
+    const auth = fakeFetch(() => ({ status: 403, body: {} }));
+    const authFailure = await pullPatient({ iss: BASE, patientId: 'p1', fetchImpl: auth.fetch }).catch((e: unknown) => e);
+    expect(toFhirBridgeError(authFailure)).toMatchObject({ code: 'PULL_AUTH', exitCode: 77 });
+    const hanging = ((_input: unknown, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+      })) as typeof fetch;
+    const slow = await pullPatient({ iss: BASE, patientId: 'p1', timeoutMs: 20, fetchImpl: hanging }).catch((e: unknown) => e);
+    expect(toFhirBridgeError(slow).code).toBe('PULL_TIMEOUT');
+    const server = fakeFetch(() => ({ status: 500, body: {} }));
+    const other = await pullPatient({ iss: BASE, patientId: 'p1', fetchImpl: server.fetch }).catch((e: unknown) => e);
+    expect(toFhirBridgeError(other).code).toBe('PULL_FAILED');
+  });
+
+  it('enforces input limits across all pages and keeps no raw page text', async () => {
+    const pages = fakeFetch((url) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      const resources = [{ resourceType: 'Observation', id: `o${page}a` }, { resourceType: 'Observation', id: `o${page}b` }];
+      return { status: 200, body: bundle(resources, `${BASE}/Patient/p1/$everything?page=${page + 1}`) };
+    });
+    const tooMany = pullPatient({
+      iss: BASE,
+      patientId: 'p1',
+      limits: { maxInputBytes: 1_000_000, maxResources: 5 },
+      fetchImpl: pages.fetch,
+    });
+    await expect(tooMany).rejects.toMatchObject({ code: 'INPUT_TOO_LARGE' });
+    const tooBig = pullPatient({
+      iss: BASE,
+      patientId: 'p1',
+      limits: { maxInputBytes: 400, maxResources: 100 },
+      fetchImpl: pages.fetch,
+    });
+    await expect(tooBig).rejects.toMatchObject({ code: 'INPUT_TOO_LARGE' });
+    const ok = fakeFetch(() => ({ status: 200, body: bundle([{ resourceType: 'Patient', id: 'p1' }]) }));
+    const result = await pullPatient({ iss: BASE, patientId: 'p1', fetchImpl: ok.fetch });
+    expect(result.rawText).toBeUndefined();
+    expect(result.bytes).toBeGreaterThan(0);
+  });
+
+  it('refuses private, link-local and metadata IP literals unless allowed; localhost stays open', async () => {
+    const blocked = [
+      'https://10.0.0.5/fhir',
+      'https://172.16.4.1/fhir',
+      'https://172.31.255.255/fhir',
+      'https://192.168.1.10/fhir',
+      'https://169.254.169.254/latest',
+      'https://127.0.0.2/fhir',
+      'https://[::1]:8443/fhir',
+      'https://[fc00::1]/fhir',
+      'https://[fd12:3456::1]/fhir',
+      'https://[fe80::1]/fhir',
+      'https://[::ffff:10.0.0.1]/fhir',
+    ];
+    for (const iss of blocked.filter((u) => !u.includes('[::1]'))) {
+      expect(() => normalizeBaseUrl(iss), iss).toThrow(/private network|private, loopback/);
+      expect(() => normalizeBaseUrl(iss, true), iss).not.toThrow();
+    }
+    expect(() => normalizeBaseUrl('https://172.32.0.1/fhir')).not.toThrow();
+    expect(() => normalizeBaseUrl('http://localhost:8080/fhir')).not.toThrow();
+    expect(() => normalizeBaseUrl('http://127.0.0.1:8080/fhir')).not.toThrow();
+    expect(() => normalizeBaseUrl('http://[::1]:8080/fhir')).not.toThrow();
+    await expect(pullPatient({ iss: 'https://10.0.0.5/fhir', patientId: 'p1' })).rejects.toBeInstanceOf(FhirPullError);
   });
 });
