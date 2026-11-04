@@ -9,7 +9,7 @@ import { rehydrate } from './stream-rehydrator.js';
 
 export { auditCitations, extractNumbers } from './citation-auditor.js';
 export { splitSentences } from './sentence-splitter.js';
-export { StreamRehydrator, rehydrate } from './stream-rehydrator.js';
+export { StreamRehydrator, extractTokens, rehydrate } from './stream-rehydrator.js';
 
 export interface VerifyResult {
   report: CitationAuditReport;
@@ -28,6 +28,6 @@ export function verify(
   vault?: VaultReader,
   opts?: RehydrateOptions,
 ): VerifyResult {
-  const report = auditCitations(text, graph);
+  const report = auditCitations(text, graph, vault);
   return vault ? { report, rehydrated: rehydrate(text, vault, opts) } : { report };
 }

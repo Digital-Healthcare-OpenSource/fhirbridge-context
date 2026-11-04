@@ -61,6 +61,8 @@
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "lint": "tsc --noEmit",
     "fixtures": "node scripts/generate-fixture.mjs",
     "bench": "node scripts/benchmark.mjs"
@@ -72,6 +74,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.0",
+    "@vitest/coverage-v8": "^5.1.0",
     "tsup": "^9.0.0",
     "typescript": "^6.0.3",
     "vitest": "^5.1.0"

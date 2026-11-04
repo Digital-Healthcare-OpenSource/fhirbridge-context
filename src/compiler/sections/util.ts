@@ -10,7 +10,12 @@ export interface SectionCtx {
   /** Restrict output to this `Patient/id` (undefined = whole graph). */
   patientKey?: string;
   now: Date;
+  /** The graph was de-identified: a full birth date must never be rendered. */
+  deidentified?: boolean;
 }
+
+/** Extension the de-identifier sets on Patient: `valueString` is an age (`'64'`) or `'90+'`. */
+export const AGE_EXTENSION_URL = 'https://fhirbridge.dev/fhir/StructureDefinition/age-at-deidentification';
 
 export function rec(value: unknown): Rec | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -68,6 +73,23 @@ export function firstConceptText(value: unknown): string | undefined {
   return conceptText(value);
 }
 
+/** Age recorded by de-identification (`'64'` or `'90+'`), if present. */
+export function ageAtDeidentification(patient: Rec): string | undefined {
+  const ext = recs(patient.extension).find((e) => e.url === AGE_EXTENSION_URL);
+  return str(ext?.valueString);
+}
+
+/**
+ * Birth date as it may be shown: the 4-digit year when de-identified (anything longer is cut to
+ * the year, defensively), the full value otherwise.
+ */
+export function visibleBirthDate(patient: Rec, deidentified: boolean | undefined): string | undefined {
+  const birth = str(patient.birthDate);
+  if (!birth) return undefined;
+  if (!deidentified) return birth;
+  return /^\d{4}/.test(birth) ? birth.slice(0, 4) : undefined;
+}
+
 export function keyOf(resource: Resource): string {
   return resourceKey(resource);
 }
@@ -81,14 +103,23 @@ export function dayOf(value: string | undefined): string | undefined {
   return value === undefined ? undefined : value.slice(0, 10);
 }
 
+/** `[BINARY_ATTACHMENT: type, size, sha256:...]` markers written by the normalizer. */
+export const BINARY_MARKER_RE = /\[BINARY_ATTACHMENT[^\]]*\]/;
+export const BINARY_OMITTED = '[binary attachment omitted]';
+
+/** Replace binary-attachment markers (which embed a payload hash) before text reaches a model. */
+export function hideBinaryMarkers(value: string): string {
+  return value.replace(new RegExp(BINARY_MARKER_RE.source, 'g'), BINARY_OMITTED);
+}
+
 export function oneLine(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, ' ').trim();
+  const flat = hideBinaryMarkers(value).replace(/\s+/g, ' ').trim();
   return flat.length <= max ? flat : `${flat.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
 }
 
 /** Escape a value for a markdown table cell. */
 export function cell(value: string): string {
-  return value.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+  return hideBinaryMarkers(value).replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
 }
 
 /** Best clinical date of a resource (raw FHIR date string). */

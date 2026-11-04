@@ -7,3 +7,8 @@ coverage/
 .fhirbridge/
 *.log
 .DS_Store
+*.vault
+*.vault.*
+*.lock
+*.tmp
+coverage/

@@ -1,8 +1,7 @@
-import { daysBetween, shiftDatesInText } from '../shared/fhir-date.js';
+import { FhirBridgeError } from '../errors.js';
+import { shiftDatesInText } from '../shared/fhir-date.js';
 import type { RehydrateOptions, VaultReader } from '../types/pipeline.js';
 
-/** Dates further than this from the emitted window are the LLM's own (guideline years, today). */
-const WINDOW_MARGIN_DAYS = 400;
 /** Never hold more than this many characters back (ample for the longest token or date). */
 const MAX_HOLD_BACK = 32;
 
@@ -18,39 +17,40 @@ const TOKEN_PREFIX_TAIL_RE = /\[[A-Z0-9_]{0,19}$/;
  */
 const DATE_PREFIX_TAIL_RE = /(?<![A-Za-z0-9_])(?:\d{1,4}|\d{4}-\d{0,2}(?:-\d{0,2})?)$/;
 
-function isRealCalendarDate(iso: string): boolean {
-  const [y, m, d] = iso.split('-').map(Number) as [number, number, number];
-  const parsed = new Date(Date.UTC(y, m - 1, d));
-  return parsed.getUTCFullYear() === y && parsed.getUTCMonth() === m - 1 && parsed.getUTCDate() === d;
-}
-
+/**
+ * Patient whose shift is reversed. With several patients in the vault the caller must say which:
+ * guessing would silently move dates by the wrong offset.
+ */
 function patientKeyFor(vault: VaultReader, requested?: string): string | undefined {
   if (requested) return requested;
-  const keys = [...vault.dateShifts().keys()];
-  return keys.length === 1 ? keys[0] : undefined;
+  const keys = vault.patientKeys();
+  if (keys.length > 1) {
+    throw new FhirBridgeError('USAGE', `Vault holds ${keys.length} patients; pass --patient Patient/id.`);
+  }
+  return keys[0];
 }
 
 type Transform = (text: string) => string;
 
-/** Build the text → text rehydration function once (shift, window and patient are fixed). */
+/** Build the text → text rehydration function once (shift, emitted dates and patient are fixed). */
 function buildTransform(vault: VaultReader, opts: RehydrateOptions): Transform {
   const patientKey = patientKeyFor(vault, opts.patientKey);
   const delta = patientKey ? vault.dateShiftDaysFor(patientKey) : undefined;
-  const window = patientKey ? vault.shiftedDateWindow(patientKey) : undefined;
+  const emitted = patientKey ? vault.emittedShiftedDates(patientKey) : undefined;
 
-  const inWindow = (iso: string): boolean => {
-    if (!isRealCalendarDate(iso)) return false;
-    if (!window) return true;
-    const fromMin = daysBetween(window.min, iso);
-    const fromMax = daysBetween(window.max, iso);
-    return fromMin >= -WINDOW_MARGIN_DAYS && fromMax <= WINDOW_MARGIN_DAYS;
-  };
+  // Only dates the tool itself emitted are reversed; any other date stays exactly as written.
+  const wasEmitted = (iso: string): boolean => emitted?.has(iso) === true;
 
   return (text) => {
     // Dates first: resolved values (e.g. a real DOB) are already unshifted and must not be touched.
-    const dated = delta === undefined || delta === 0 ? text : shiftDatesInText(text, -delta, inWindow);
+    const dated = delta === undefined || delta === 0 ? text : shiftDatesInText(text, -delta, wasEmitted);
     return dated.replace(TOKEN_RE, (token) => vault.resolveToken(token) ?? token);
   };
+}
+
+/** Distinct PHI tokens (`[PATIENT_1]`, …) appearing in `text`. */
+export function extractTokens(text: string): string[] {
+  return [...new Set(text.match(TOKEN_RE) ?? [])];
 }
 
 /** Replace PHI tokens with vault values and reverse the patient's date shift. */

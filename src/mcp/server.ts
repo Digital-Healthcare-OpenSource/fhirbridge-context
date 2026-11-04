@@ -8,25 +8,42 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { compile } from '../compiler/index.js';
-import { SafeHarborVault } from '../deid/index.js';
+import { compile, slimResource } from '../compiler/index.js';
+import { safeWarnings } from '../compiler/sections/safe-warnings.js';
+import { SafeHarborVault, type FreeTextMode } from '../deid/index.js';
 import { pack, VERSION, type PackResult } from '../index.js';
 import { loadInput } from '../normalizer/index.js';
+import { silentLogger, type Logger } from '../logger.js';
 import type { Resource } from '../types/fhir.js';
 import { resourceKey } from '../types/fhir.js';
-import type { NormalizedGraph, StatusClass } from '../types/pipeline.js';
-import { verify } from '../verifier/index.js';
+import type { NormalizedGraph, SafeHarborSummary, StatusClass, VaultReader } from '../types/pipeline.js';
+import { auditCitations, extractTokens, rehydrate } from '../verifier/index.js';
 
 export interface McpServerOptions {
   bundlePath: string;
   vaultPath?: string;
   passphrase?: string;
-  /** Return real (rehydrated) values from verify_and_rehydrate_clinical_draft. Off by default. */
+  /** Permit a key file next to the vault when no passphrase/key env var is set (off by default). */
+  allowKeyFile?: boolean;
+  /**
+   * Return REAL PHI from verify_and_rehydrate_clinical_draft (only for tokens this server has
+   * shown). Off by default; only for models running locally.
+   */
   allowRehydrate?: boolean;
+  /** `omit` serves structured data only (no free text / documents). Default `scrub`. */
+  freeText?: FreeTextMode;
+  /** Diagnostics sink (stderr). Tool calls are logged by name, outcome and duration — never arguments. */
+  logger?: Logger;
 }
 
+/** The pre-de-identification graph is deliberately absent: tools must not be able to reach it. */
 interface ServerState {
-  result: PackResult & { deidGraph: NormalizedGraph; vault: SafeHarborVault };
+  result: Pick<PackResult, 'context'> & {
+    deidGraph: NormalizedGraph;
+    vault: SafeHarborVault;
+    safeHarbor: SafeHarborSummary;
+  };
+  shownTokens: ReadonlySet<string>;
   allowRehydrate: boolean;
 }
 
@@ -69,11 +86,8 @@ function codesOf(r: Resource): string[] {
   return out.map((s) => s.toLowerCase());
 }
 
-/** Drop transport noise so the model sees clinical content only. */
-function slim(r: Resource): Resource {
-  const { meta: _meta, text: _text, ...rest } = r;
-  return rest as Resource;
-}
+/** Same hygiene as the `fhir-slim` format: no meta, extensions, primitive extensions, hashes or narrative. */
+const slim = (r: Resource): Resource => slimResource(r);
 
 export interface ResourceQuery {
   resourceType: string;
@@ -119,7 +133,7 @@ function registerReadTools(server: McpServer, state: ServerState): void {
     {
       title: 'De-identified clinical summary',
       description:
-        'Compact, HIPAA Safe Harbor de-identified clinical context. Every fact ends with a [ResourceType/id] anchor; cite those anchors in answers. Dates are consistently shifted per patient.',
+        'Compact de-identified clinical context (identifiers tokenized, other dates shifted per patient). Every fact ends with a [ResourceType/id] anchor; cite those anchors in answers.',
       inputSchema: {
         format: z.enum(['clinical-md', 'view-json', 'csv']).optional(),
         patientKey: z
@@ -165,6 +179,20 @@ function registerReadTools(server: McpServer, state: ServerState): void {
   );
 }
 
+/** A vault view that resolves only tokens the server itself put in front of the model. */
+export function restrictTokens(vault: VaultReader, allowed: ReadonlySet<string>): VaultReader {
+  return {
+    resolveToken: (t) => (allowed.has(t) ? vault.resolveToken(t) : undefined),
+    tokens: () => vault.tokens().filter((t) => allowed.has(t)),
+    dateShiftDaysFor: (k) => vault.dateShiftDaysFor(k),
+    dateShifts: () => vault.dateShifts(),
+    shiftedDateWindow: (k) => vault.shiftedDateWindow(k),
+    patientKeys: () => vault.patientKeys(),
+    emittedShiftedDates: (k) => vault.emittedShiftedDates(k),
+    originalResourceKey: (k) => vault.originalResourceKey(k),
+  };
+}
+
 function registerAuditTools(server: McpServer, state: ServerState): void {
   const { result } = state;
   server.registerTool(
@@ -172,13 +200,22 @@ function registerAuditTools(server: McpServer, state: ServerState): void {
     {
       title: 'Verify a clinical draft',
       description:
-        'Audit every [ResourceType/id] citation in a draft: hallucinated ids, stopped/entered-in-error records described as current, and numbers that do not match the cited observation. Returns the audit report. Real identities are restored only if the server was started with --allow-rehydrate.',
-      inputSchema: { draft: z.string().min(1).max(200_000) },
+        'Audit every [ResourceType/id] citation in a draft: hallucinated ids, stopped/entered-in-error records described as current, and numbers that do not match the cited observation. Returns the audit report. Real identities are restored only if the server was started with --allow-rehydrate, and then only for tokens this server has shown.',
+      inputSchema: {
+        draft: z.string().min(1).max(200_000),
+        patientKey: z
+          .string()
+          .regex(/^Patient\/[A-Za-z0-9\-.]{1,64}$/)
+          .optional(),
+      },
       annotations: { readOnlyHint: true },
     },
-    async ({ draft }) => {
-      const out = verify(draft, result.graph, state.allowRehydrate ? result.vault : undefined);
-      return text(JSON.stringify(out, null, 1));
+    async ({ draft, patientKey }) => {
+      // Audit in the de-identified frame the model works in; the pre-de-identification graph is never read here.
+      const report = auditCitations(draft, result.deidGraph);
+      if (!state.allowRehydrate) return text(JSON.stringify({ report }, null, 1));
+      const scoped = restrictTokens(result.vault, state.shownTokens);
+      return text(JSON.stringify({ report, rehydrated: rehydrate(draft, scoped, { patientKey }) }, null, 1));
     },
   );
 
@@ -187,20 +224,17 @@ function registerAuditTools(server: McpServer, state: ServerState): void {
     {
       title: 'Audit EHR data integrity',
       description:
-        'Report EHR data problems found during normalization: entered-in-error exclusions, RxNorm code/display conflicts, unresolved references, decoded attachments, plus Safe Harbor and token statistics.',
+        'Report EHR data problems found during normalization: entered-in-error exclusions, RxNorm code/display conflicts, unresolved references, decoded attachments, plus de-identification and token statistics (counts only).',
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
+    // Built from the de-identified graph only: pre-de-identification warnings carry raw values.
     async () =>
       text(
         JSON.stringify(
           {
-            excluded: result.graph.excluded,
-            warnings: result.graph.warnings.map((w) => ({
-              code: w.code,
-              resourceKey: w.resourceKey,
-              message: w.message,
-            })),
+            excluded: result.deidGraph.excluded,
+            warnings: safeWarnings(result.deidGraph),
             safeHarbor: result.safeHarbor,
             tokens: result.context.tokens,
           },
@@ -211,25 +245,97 @@ function registerAuditTools(server: McpServer, state: ServerState): void {
   );
 }
 
+/** Every PHI token a tool of this server can show the model (all context formats + raw queries). */
+function collectShownTokens(deidGraph: NormalizedGraph, safeHarbor: SafeHarborSummary): ReadonlySet<string> {
+  const shown = new Set<string>(extractTokens(JSON.stringify(deidGraph.resources)));
+  for (const format of ['clinical-md', 'view-json', 'csv'] as const) {
+    for (const token of extractTokens(compile(deidGraph, { format, safeHarbor }).content)) shown.add(token);
+  }
+  return shown;
+}
+
 export async function createMcpServer(opts: McpServerOptions): Promise<McpServer> {
   const vault = opts.vaultPath
-    ? await SafeHarborVault.open(opts.vaultPath, { passphrase: opts.passphrase })
+    ? await SafeHarborVault.open(opts.vaultPath, {
+        passphrase: opts.passphrase,
+        allowKeyFile: opts.allowKeyFile === true,
+      })
     : SafeHarborVault.create();
-  const packed = pack(await loadInput(opts.bundlePath), { deid: true, vault });
-  if (!packed.deidGraph || !packed.vault) throw new Error('De-identification did not run.');
+  const packed = pack(await loadInput(opts.bundlePath), {
+    deid: true,
+    vault,
+    freeText: opts.freeText,
+  });
+  if (!packed.deidGraph || !packed.vault || !packed.safeHarbor) throw new Error('De-identification did not run.');
   if (opts.vaultPath) await vault.save(opts.vaultPath);
   const state: ServerState = {
-    result: { ...packed, deidGraph: packed.deidGraph, vault: packed.vault },
+    result: {
+      deidGraph: packed.deidGraph,
+      vault: packed.vault,
+      safeHarbor: packed.safeHarbor,
+      context: packed.context,
+    },
+    shownTokens: collectShownTokens(packed.deidGraph, packed.safeHarbor),
     allowRehydrate: opts.allowRehydrate === true,
   };
   const server = new McpServer({ name: 'fhirbridge', version: VERSION });
+  instrumentTools(server, opts.logger ?? silentLogger);
   registerReadTools(server, state);
   registerAuditTools(server, state);
   return server;
 }
 
-/** Start the server on stdio. stdout is the MCP channel; never write logs there. */
+interface ToolResultLike {
+  isError?: boolean;
+}
+
+/**
+ * Wrap every tool callback registered from now on with timing/outcome logging. Arguments and
+ * results are never logged: drafts and resources are model-facing data.
+ */
+function instrumentTools(server: McpServer, logger: Logger): void {
+  const register = server.registerTool.bind(server) as (...args: unknown[]) => unknown;
+  const patched = (name: string, config: unknown, cb: (...cbArgs: unknown[]) => unknown): unknown =>
+    register(name, config, async (...cbArgs: unknown[]) => {
+      const start = performance.now();
+      try {
+        const result = (await cb(...cbArgs)) as ToolResultLike;
+        logger.info('mcp.tool', { tool: name, ok: result?.isError !== true, ms: Math.round(performance.now() - start) });
+        return result;
+      } catch (error) {
+        const code = (error as { code?: unknown } | null)?.code;
+        logger.warn('mcp.tool', {
+          tool: name,
+          ok: false,
+          code: typeof code === 'string' ? code : 'ERROR',
+          ms: Math.round(performance.now() - start),
+        });
+        throw error;
+      }
+    });
+  (server as unknown as { registerTool: typeof patched }).registerTool = patched;
+}
+
+/**
+ * Start the server on stdio. stdout is the MCP channel; never write logs there.
+ * SIGINT/SIGTERM and stdin EOF close the transport cleanly so the host sees a normal exit.
+ */
 export async function runMcpServer(opts: McpServerOptions): Promise<void> {
+  const logger = opts.logger ?? silentLogger;
   const server = await createMcpServer(opts);
-  await server.connect(new StdioServerTransport());
+  const transport = new StdioServerTransport();
+  let closing = false;
+  const shutdown = (reason: string): void => {
+    if (closing) return;
+    closing = true;
+    logger.info('mcp.shutdown', { reason });
+    void server.close().finally(() => {
+      process.exitCode = process.exitCode ?? 0;
+    });
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.stdin.once('end', () => shutdown('stdin-closed'));
+  await server.connect(transport);
+  logger.info('mcp.ready', { tools: 4, rehydrate: opts.allowRehydrate === true });
 }

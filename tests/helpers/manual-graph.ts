@@ -113,20 +113,26 @@ export interface FakeVaultOptions {
   tokens?: Record<string, string>;
   /** `Patient/id` → day offset. */
   shifts?: Record<string, number>;
-  /** `Patient/id` → shifted-date window. */
-  windows?: Record<string, { min: string; max: string }>;
+  /** `Patient/id` → exact shifted dates (YYYY-MM-DD) the de-identifier emitted. */
+  emitted?: Record<string, string[]>;
+  /** De-identified `Type/id` → original `Type/id` for pseudonymized resource ids. */
+  originalKeys?: Record<string, string>;
 }
 
 export function fakeVault(opts: FakeVaultOptions = {}): VaultReader {
   const tokens = opts.tokens ?? {};
   const shifts = new Map(Object.entries(opts.shifts ?? {}));
-  const windows = opts.windows ?? {};
+  const emitted = opts.emitted ?? {};
+  const originalKeys = opts.originalKeys ?? {};
   return {
     resolveToken: (t) => tokens[t],
     tokens: () => Object.keys(tokens),
     dateShiftDaysFor: (p) => shifts.get(p),
     dateShifts: () => shifts,
-    shiftedDateWindow: (p) => windows[p],
+    shiftedDateWindow: () => undefined,
+    patientKeys: () => [...shifts.keys()],
+    emittedShiftedDates: (p) => new Set(emitted[p] ?? []),
+    originalResourceKey: (k) => originalKeys[k],
   };
 }
 

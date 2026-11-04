@@ -1,16 +1,25 @@
 import type { Resource } from '../types/fhir.js';
 import { resourceKey } from '../types/fhir.js';
-import type { NormalizedGraph, ViewRow, ViewTables } from '../types/pipeline.js';
+import type { NormalizedGraph, SafeHarborSummary, ViewRow, ViewTables } from '../types/pipeline.js';
 import { ageInYears } from '../shared/fhir-date.js';
 import { medInfo } from './sections/medications.js';
-import { findCoding, inScope, rec, str, type Rec, type SectionCtx } from './sections/util.js';
+import {
+  ageAtDeidentification,
+  findCoding,
+  hideBinaryMarkers,
+  inScope,
+  rec,
+  str,
+  visibleBirthDate,
+  type Rec,
+  type SectionCtx,
+} from './sections/util.js';
 
 /* ------------------------------------------------------------------ */
 /* Key helpers                                                         */
 /* ------------------------------------------------------------------ */
 
 const TYPE_ID_TAIL_RE = /(?:^|\/)([A-Z][A-Za-z]+)\/([A-Za-z0-9\-.]{1,64})(?:\/_history\/[^/]+)?$/;
-const AGE_CAP_BIRTH_DATE = '1900-01-01';
 
 /** Canonical `ResourceType/id` of a resource. */
 export function getResourceKey(resource: Pick<Resource, 'resourceType' | 'id'>): string {
@@ -56,6 +65,7 @@ interface EvalCtx {
   graph: NormalizedGraph;
   resource: Resource;
   now: Date;
+  deidentified: boolean;
 }
 
 function step(values: unknown[], segment: string): unknown[] {
@@ -73,7 +83,8 @@ function firstValue(resource: unknown, path: string): unknown {
 }
 
 function scalar(value: unknown): Scalar {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' ? value : null;
+  if (typeof value === 'string') return hideBinaryMarkers(value);
+  return typeof value === 'number' || typeof value === 'boolean' ? value : null;
 }
 
 function callFunction(name: string, arg: string, ec: EvalCtx): Scalar {
@@ -97,10 +108,15 @@ function callFunction(name: string, arg: string, ec: EvalCtx): Scalar {
       return (system ? findCoding(concept, new RegExp(system, 'i')) : undefined)?.code ?? scalar(firstValue(concept, 'coding.0.code'));
     }
     case 'getAge': {
+      const recorded = ageAtDeidentification(r);
+      if (recorded !== undefined) return /^\d+$/.test(recorded) ? Number(recorded) : recorded;
       const birth = str(r.birthDate);
-      if (!birth) return null;
-      return birth === AGE_CAP_BIRTH_DATE ? '90+' : (ageInYears(birth, ec.now) ?? null);
+      // A de-identified record without the age extension has at most a year: no computed age.
+      if (!birth || ec.deidentified) return null;
+      return ageInYears(birth, ec.now) ?? null;
     }
+    case 'getBirthDate':
+      return visibleBirthDate(r, ec.deidentified) ?? null;
     default:
       return null;
   }
@@ -124,20 +140,28 @@ function matchesWhere(where: ViewWhere[] | undefined, ec: EvalCtx): boolean {
   });
 }
 
+export interface ViewOptions {
+  patientKey?: string;
+  now?: Date;
+  /** Present when the graph was de-identified: full birth dates are then never emitted. */
+  safeHarbor?: SafeHarborSummary;
+}
+
 /** Project every matching resource of the graph through a ViewDefinition. */
 export function runViewDefinition(
   def: ViewDefinition,
   graph: NormalizedGraph,
-  opts: { patientKey?: string; now?: Date } = {},
+  opts: ViewOptions = {},
 ): ViewRow[] {
   const types = typeof def.resource === 'string' ? [def.resource] : def.resource;
   const now = opts.now ?? new Date();
-  const scope: SectionCtx = { graph, patientKey: opts.patientKey, now };
+  const deidentified = opts.safeHarbor !== undefined;
+  const scope: SectionCtx = { graph, patientKey: opts.patientKey, now, deidentified };
   const rows: ViewRow[] = [];
   for (const resource of graph.resources) {
     const key = getResourceKey(resource);
     if (!types.includes(resource.resourceType) || !inScope(scope, key)) continue;
-    const ec: EvalCtx = { graph, resource, now };
+    const ec: EvalCtx = { graph, resource, now, deidentified };
     if (!matchesWhere(def.where, ec)) continue;
     const row: ViewRow = {};
     for (const select of def.select) for (const col of select.column) row[col.name] = evalExpr(col.path, ec);
@@ -167,7 +191,7 @@ export const VIEW_DEFINITIONS: Record<keyof ViewTables, ViewDefinition> = {
           ...keys('getResourceKey()'),
           { name: 'name', path: 'name.0.text | name.0.family' },
           { name: 'gender', path: 'gender' },
-          { name: 'birth_date', path: 'birthDate' },
+          { name: 'birth_date', path: 'getBirthDate()' },
           { name: 'age', path: 'getAge()' },
           { name: 'postal_code', path: 'address.0.postalCode' },
           { name: 'mrn', path: 'identifier.0.value' },
@@ -251,7 +275,7 @@ function sortRows(rows: ViewRow[], columns: string[]): ViewRow[] {
 /** Compile the four SQL-on-FHIR style tables; every row carries `resource_key` and `subject_key`. */
 export function compileViews(
   graph: NormalizedGraph,
-  opts: { patientKey?: string; now?: Date } = {},
+  opts: ViewOptions = {},
 ): ViewTables {
   const table = (name: keyof ViewTables): ViewRow[] =>
     sortRows(runViewDefinition(VIEW_DEFINITIONS[name], graph, opts), SORT_COLUMNS[name]);

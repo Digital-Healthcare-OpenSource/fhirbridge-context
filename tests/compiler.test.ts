@@ -17,14 +17,15 @@ const SAFE_HARBOR: SafeHarborSummary = {
   enabled: true,
   replacements: {},
   datesShifted: 0,
-  dateShiftDays: { 'Patient/pat-1': -142 },
+  patientsShifted: 1,
   agesCapped: 0,
   zip3Restricted: 0,
   zip3Generalized: 0,
   rulesApplied: [],
 };
 
-const RXNORM = 'http://www.nlm.nih.gov/research/umls/rxnorm';
+const AGE_EXT = 'https://fhirbridge.dev/fhir/StructureDefinition/age-at-deidentification';
+const RXNORM ='http://www.nlm.nih.gov/research/umls/rxnorm';
 const ref = { reference: 'Patient/pat-1' };
 
 function clinicalResources(): Resource[] {
@@ -119,13 +120,22 @@ const compileMd = (graph = clinicalGraph(), extra: Partial<Parameters<typeof com
   compileClinicalMarkdown(graph, { format: 'clinical-md', now: NOW, ...extra });
 
 describe('clinical-md compiler', () => {
-  it('prints the header with SafeHarbor and date shift when de-identified', () => {
+  it('prints De-identified: YES in the header and never a date offset', () => {
     const md = compileMd(clinicalGraph(), { safeHarbor: SAFE_HARBOR, version: '0.1.0' });
-    expect(md.split('\n')[0]).toBe('# CLINICAL SUMMARY CONTEXT (FHIRBridge v0.1.0 | SafeHarbor: ENABLED | DateShift: -142d)');
+    expect(md.split('\n')[0]).toBe('# CLINICAL SUMMARY CONTEXT (FHIRBridge v0.1.0 | De-identified: YES)');
   });
 
-  it('prints SafeHarbor: DISABLED without a date shift otherwise', () => {
-    expect(compileMd().split('\n')[0]).toBe('# CLINICAL SUMMARY CONTEXT (FHIRBridge v0.1.0 | SafeHarbor: DISABLED)');
+  it('prints De-identified: NO otherwise', () => {
+    expect(compileMd().split('\n')[0]).toBe('# CLINICAL SUMMARY CONTEXT (FHIRBridge v0.1.0 | De-identified: NO)');
+  });
+
+  it('never renders a date offset or the word DateShift in any output format', () => {
+    const graph = clinicalGraph();
+    for (const format of ['clinical-md', 'view-json', 'csv', 'fhir-slim'] as const) {
+      const { content } = compile(graph, { format, now: NOW, safeHarbor: SAFE_HARBOR });
+      expect(content, format).not.toMatch(/DateShift/i);
+      expect(content, format).not.toMatch(/-?142\s*d\b/);
+    }
   });
 
   it('emits sections in spec order', () => {
@@ -141,12 +151,59 @@ describe('clinical-md compiler', () => {
     );
   });
 
-  it('prints Age: 90+ and omits the DOB for age-capped patients', () => {
-    const graph = buildGraph([patient({ birthDate: '1900-01-01' })]);
-    const md = compileMd(graph);
-    expect(md).toContain('Age: 90+');
+  it('shows recorded age and birth year, never a full DOB, when de-identified', () => {
+    const deid = patient({ birthDate: '1962', extension: [{ url: AGE_EXT, valueString: '64' }] });
+    const md = compileMd(buildGraph([deid]), { safeHarbor: SAFE_HARBOR });
+    expect(md).toContain('Age: 64 | Birth year: 1962');
     expect(md).not.toContain('DOB');
-    expect(md).not.toContain('1900');
+  });
+
+  it('cuts a leaked full birth date down to the year in de-identified output', () => {
+    const md = compileMd(buildGraph([patient()]), { safeHarbor: SAFE_HARBOR });
+    expect(md).toContain('Birth year: 1962');
+    expect(md).not.toContain('1962-03-14');
+    const views = compile(buildGraph([patient()]), { format: 'view-json', now: NOW, safeHarbor: SAFE_HARBOR });
+    expect(views.content).not.toContain('1962-03-14');
+  });
+
+  it('prints Age: 90+ and no birth year for age-capped patients', () => {
+    const capped = patient({ birthDate: undefined, extension: [{ url: AGE_EXT, valueString: '90+' }] });
+    const md = compileMd(buildGraph([capped]), { safeHarbor: SAFE_HARBOR });
+    expect(md).toContain('Age: 90+');
+    expect(md).not.toContain('Birth year');
+    expect(md).not.toContain('DOB');
+    const row = compileViews(buildGraph([capped]), { now: NOW, safeHarbor: SAFE_HARBOR }).patient_demographics[0];
+    expect(row).toMatchObject({ age: '90+', birth_date: null });
+  });
+
+  it('keeps the full DOB when the output is not de-identified', () => {
+    const md = compileMd(buildGraph([patient()]));
+    expect(md).toContain('Age: 64 (DOB: 1962-03-14)');
+  });
+
+  it('keeps the age extension in fhir-slim output', () => {
+    const capped = patient({ birthDate: undefined, extension: [{ url: AGE_EXT, valueString: '90+' }, { url: 'x', valueString: 'drop' }] });
+    const { content } = compile(buildGraph([capped]), { format: 'fhir-slim', now: NOW, safeHarbor: SAFE_HARBOR });
+    expect(content).toContain('90+');
+    expect(content).not.toContain('drop');
+  });
+
+  it('renders section 8 from allow-listed warning fields only', () => {
+    const graph = buildGraph([patient(), medRequest('medreq-bad-1')], {
+      warnings: [
+        {
+          code: 'CODE_DISPLAY_MISMATCH',
+          resourceKey: 'MedicationRequest/medreq-bad-1',
+          message: 'mismatch',
+          details: { display: 'Tiotropium 18 MCG', code: '1116634', expected: 'ticagrelor', leak: 'Gonzalez 1962-03-14' },
+        },
+        { code: 'LAST_UPDATED_INFERRED', resourceKey: 'Observation/o1', message: 'inferred', details: { at: '2021-03-15' } },
+      ],
+    });
+    const md = compileMd(graph, { safeHarbor: SAFE_HARBOR });
+    expect(md).toContain('CODE WARNING: [MedicationRequest/medreq-bad-1] display "Tiotropium 18 MCG" conflicts with RxCUI 1116634 ("ticagrelor")');
+    expect(md).not.toContain('Gonzalez');
+    expect(md).not.toContain('2021-03-15');
   });
 
   it('lists allergies and conditions, keeping resolved conditions apart', () => {
@@ -351,5 +408,50 @@ describe('compile() formats', () => {
     expect(out.content).not.toContain('"bad"');
     expect(out.content).toContain('"text":"Metformin 500 MG Oral Tablet"');
     expect(out.content).not.toContain('\n');
+  });
+
+  describe('binary attachment markers', () => {
+    const HASH = 'a'.repeat(64);
+    const MARKER = `[BINARY_ATTACHMENT: application/pdf, 6, sha256:${HASH}]`;
+    const withMarkers = () =>
+      buildGraph([
+        patient(),
+        {
+          resourceType: 'DocumentReference',
+          id: 'd1',
+          status: 'current',
+          subject: ref,
+          content: [{ attachment: { contentType: 'application/pdf', size: 6, hash: HASH, title: MARKER } }],
+        },
+        {
+          resourceType: 'Condition',
+          id: 'c1',
+          clinicalStatus: { coding: [{ code: 'active' }] },
+          subject: ref,
+          code: { text: `Scan ${MARKER}` },
+          note: [{ text: `see ${MARKER}` }],
+        },
+      ]);
+
+    it('never prints payload hashes or markers in any format', () => {
+      for (const format of ['clinical-md', 'view-json', 'csv', 'fhir-slim'] as const) {
+        const { content } = compile(withMarkers(), { format, now: NOW });
+        expect(content, format).not.toContain(HASH);
+        expect(content, format).not.toContain('BINARY_ATTACHMENT');
+        expect(content, format).not.toMatch(/sha256/i);
+      }
+    });
+
+    it('shows a neutral placeholder instead', () => {
+      expect(compile(withMarkers(), { format: 'fhir-slim', now: NOW }).content).toContain('[binary attachment omitted]');
+      expect(compile(withMarkers(), { format: 'csv', now: NOW }).content).toContain('Scan [binary attachment omitted]');
+    });
+
+    it('fhir-slim also drops primitive extensions such as _birthDate', () => {
+      const g = buildGraph([patient({ _birthDate: { extension: [{ url: 'u', valueDateTime: '1930-03-05T08:15:00Z' }] } })]);
+      const { content } = compile(g, { format: 'fhir-slim' });
+      expect(content).not.toContain('_birthDate');
+      expect(content).not.toContain('08:15');
+    });
   });
 });

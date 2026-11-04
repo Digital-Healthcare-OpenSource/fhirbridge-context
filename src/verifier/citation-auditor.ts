@@ -5,6 +5,7 @@ import type {
   CitationIssue,
   NormalizedGraph,
   StatusClass,
+  VaultReader,
 } from '../types/pipeline.js';
 import { splitSentences } from './sentence-splitter.js';
 
@@ -114,6 +115,7 @@ interface AuditState {
   graph: NormalizedGraph;
   issues: CitationIssue[];
   citations: CitationCheck[];
+  keyMap?: Pick<VaultReader, 'originalResourceKey'>;
   series?: Map<string, number[]>;
 }
 
@@ -161,8 +163,10 @@ function checkNumbers(state: AuditState, key: string, resource: Resource, senten
 
 function auditAnchor(state: AuditState, key: string, sentence: string): void {
   const before = state.issues.length;
-  const resource = state.graph.index.get(key);
-  const status = resource ? (state.graph.status.get(key) ?? 'unknown') : undefined;
+  // The model cites pseudonymized ids; the source graph is keyed by the original ones.
+  const sourceKey = state.keyMap?.originalResourceKey(key) ?? key;
+  const resource = state.graph.index.get(sourceKey);
+  const status = resource ? (state.graph.status.get(sourceKey) ?? 'unknown') : undefined;
   if (!resource || status === undefined) {
     pushIssue(state, 'HALLUCINATED_RESOURCE_ID', 'critical', key, sentence,
       `${key} does not exist in the source record.`);
@@ -183,9 +187,16 @@ function citedKeys(sentence: string): string[] {
   return [...new Set([...sentence.matchAll(ANCHOR_RE)].map((m) => `${m[1]}/${m[2]}`))];
 }
 
-/** Verify every `[ResourceType/id]` citation in LLM output against the source graph. */
-export function auditCitations(text: string, graph: NormalizedGraph): CitationAuditReport {
-  const state: AuditState = { graph, issues: [], citations: [] };
+/**
+ * Verify every `[ResourceType/id]` citation in LLM output against the source graph. When the
+ * context was de-identified, pass the vault so pseudonymized ids map back to the source ids.
+ */
+export function auditCitations(
+  text: string,
+  graph: NormalizedGraph,
+  vault?: Pick<VaultReader, 'originalResourceKey'>,
+): CitationAuditReport {
+  const state: AuditState = { graph, issues: [], citations: [], keyMap: vault };
   for (const sentence of splitSentences(text)) {
     for (const key of citedKeys(sentence)) auditAnchor(state, key, sentence);
   }

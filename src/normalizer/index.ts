@@ -4,9 +4,8 @@
  *   loadInput/parseInput → normalize → { resources, index, status, members, medications, … }
  */
 import { createHash } from 'node:crypto';
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { extname, join } from 'node:path';
-import { estimateTokens } from '../shared/token-estimate.js';
+import { estimateTokensFromBytes } from '../shared/token-estimate.js';
+import { expandBundles, loadInput } from './input-loader.js';
 import type { Resource } from '../types/fhir.js';
 import { isResource, resourceKey } from '../types/fhir.js';
 import type {
@@ -29,134 +28,8 @@ export { classifyStatus, lintMedicationCodes, normalizeMedicationConcept } from 
 export { buildResourceIndex, resolveMedicationReferences } from './graph-resolver.js';
 export { decodeAttachments, prepareResource, shortenIds, stripMarkup, stripRtf } from './attachment-decoder.js';
 
-const MAX_BUNDLE_DEPTH = 8;
-const LOADABLE_EXTENSIONS: ReadonlySet<string> = new Set(['.json', '.ndjson']);
-
-/* ------------------------------ parsing ------------------------------ */
-
-export interface ParsedInput {
-  entries: InputEntry[];
-  source: LoadedInput['source'];
-  /** Lines/elements that were not FHIR resources. */
-  warnings: IntegrityWarning[];
-}
-
-function invalid(message: string): IntegrityWarning {
-  return { code: 'INVALID_RESOURCE', resourceKey: '(input)', message };
-}
-
-/** Expand (possibly nested) Bundles into their entries. */
-function expandBundles(entries: readonly InputEntry[], depth = 0): InputEntry[] {
-  const out: InputEntry[] = [];
-  for (const entry of entries) {
-    if (entry.resource.resourceType !== 'Bundle') {
-      out.push(entry);
-    } else if (depth < MAX_BUNDLE_DEPTH) {
-      out.push(...expandBundles(bundleEntries(entry.resource), depth + 1));
-    }
-  }
-  return out;
-}
-
-function bundleEntries(bundle: Resource): InputEntry[] {
-  const raw = bundle['entry'];
-  if (!Array.isArray(raw)) return [];
-  const entries: InputEntry[] = [];
-  for (const item of raw as unknown[]) {
-    if (typeof item !== 'object' || item === null) continue;
-    const { resource, fullUrl } = item as { resource?: unknown; fullUrl?: unknown };
-    if (!isResource(resource)) continue;
-    entries.push(typeof fullUrl === 'string' ? { resource, fullUrl } : { resource });
-  }
-  return entries;
-}
-
-function toEntries(values: readonly unknown[], warnings: IntegrityWarning[], label: string): InputEntry[] {
-  const entries: InputEntry[] = [];
-  values.forEach((value, i) => {
-    if (isResource(value)) entries.push({ resource: value });
-    else warnings.push(invalid(`${label} ${i + 1} is not a FHIR resource`));
-  });
-  return expandBundles(entries);
-}
-
-function tryJson(text: string): { ok: true; value: unknown } | { ok: false } {
-  try {
-    return { ok: true, value: JSON.parse(text) as unknown };
-  } catch {
-    return { ok: false };
-  }
-}
-
-/** Accept a Bundle, a JSON array of resources, a single resource or NDJSON. Throws on unusable input. */
-export function parseInput(text: string): ParsedInput {
-  const body = text.replace(/^﻿/, '').trim();
-  if (!body) throw new Error('Input is empty');
-  const warnings: IntegrityWarning[] = [];
-
-  const whole = tryJson(body);
-  if (whole.ok) {
-    const value = whole.value;
-    if (Array.isArray(value)) {
-      return { entries: toEntries(value, warnings, 'array element'), source: 'resource-array', warnings };
-    }
-    if (isResource(value)) {
-      const source = value.resourceType === 'Bundle' ? 'bundle' : 'single-resource';
-      return { entries: expandBundles([{ resource: value }]), source, warnings };
-    }
-    throw new Error('JSON input is not a FHIR resource, Bundle or array of resources');
-  }
-
-  const values: unknown[] = [];
-  body.split(/\r?\n/).forEach((line, i) => {
-    if (!line.trim()) return;
-    const parsed = tryJson(line);
-    if (parsed.ok) values.push(parsed.value);
-    else warnings.push(invalid(`NDJSON line ${i + 1} is not valid JSON`));
-  });
-  if (values.length === 0) throw new Error('Input is neither valid JSON nor NDJSON');
-  return { entries: toEntries(values, warnings, 'NDJSON line'), source: 'ndjson-file', warnings };
-}
-
-export type LoadedInputWithWarnings = LoadedInput & { warnings?: IntegrityWarning[] };
-
-/** Load a .json/.ndjson file, or a directory of such files (Bulk `$export` output). */
-export async function loadInput(path: string): Promise<LoadedInputWithWarnings> {
-  const info = await stat(path);
-  if (!info.isDirectory()) return loadFile(path);
-
-  const names = (await readdir(path))
-    .filter((n) => LOADABLE_EXTENSIONS.has(extname(n).toLowerCase()))
-    .sort();
-  if (names.length === 0) throw new Error(`No .ndjson/.json files found in ${path}`);
-
-  const entries: InputEntry[] = [];
-  const warnings: IntegrityWarning[] = [];
-  const texts: string[] = [];
-  let bytes = 0;
-  for (const name of names) {
-    const file = await loadFile(join(path, name));
-    entries.push(...file.entries);
-    warnings.push(...(file.warnings ?? []));
-    texts.push(file.rawText);
-    bytes += file.bytes;
-  }
-  return { entries, bytes, rawText: texts.join('\n'), source: 'ndjson-dir', warnings };
-}
-
-async function loadFile(path: string): Promise<LoadedInputWithWarnings> {
-  const buffer = await readFile(path);
-  const rawText = buffer.toString('utf8');
-  const parsed = parseInput(rawText);
-  const isNdjson = extname(path).toLowerCase() === '.ndjson';
-  return {
-    entries: parsed.entries,
-    bytes: buffer.length,
-    rawText,
-    source: isNdjson ? 'ndjson-file' : parsed.source,
-    warnings: parsed.warnings,
-  };
-}
+export { expandBundles, loadInput, parseInput } from './input-loader.js';
+export type { LoadedInputWithWarnings, ParsedInput } from './input-loader.js';
 
 /* ------------------------------ normalize ------------------------------ */
 
@@ -234,7 +107,7 @@ export function normalize(entries: InputEntry[], opts: NormalizeOptions = {}): N
   const members = buildMembers(resources, index);
   warnings.push(...gate.warnings, ...meds.warnings, ...members.warnings);
 
-  const rawText = opts.rawText ?? '';
+  const inputBytes = resolveInputBytes(opts, entries);
   return {
     resources,
     index,
@@ -248,17 +121,23 @@ export function normalize(entries: InputEntry[], opts: NormalizeOptions = {}): N
     idMap: shortened.idMap,
     stats: {
       inputResources: cloned.length,
-      inputBytes: opts.inputBytes ?? Buffer.byteLength(rawText, 'utf8'),
-      inputTokens: estimateTokens(rawText),
+      inputBytes,
+      inputTokens: estimateTokensFromBytes(inputBytes),
     },
   };
 }
 
+/**
+ * Byte size of the original input for the "before" token estimate: the loader's byte count,
+ * else the caller's raw text, else the serialized entries (SDK callers passing objects).
+ */
+function resolveInputBytes(opts: NormalizeOptions, entries: readonly InputEntry[]): number {
+  if (opts.inputBytes !== undefined) return opts.inputBytes;
+  if (opts.rawText !== undefined) return Buffer.byteLength(opts.rawText, 'utf8');
+  return Buffer.byteLength(JSON.stringify(entries.map((e) => e.resource)), 'utf8');
+}
+
 export async function normalizeFile(path: string): Promise<NormalizedGraph> {
   const loaded = await loadInput(path);
-  return normalize(loaded.entries, {
-    inputBytes: loaded.bytes,
-    rawText: loaded.rawText,
-    warnings: loaded.warnings,
-  });
+  return normalize(loaded.entries, { inputBytes: loaded.bytes, warnings: loaded.warnings });
 }
