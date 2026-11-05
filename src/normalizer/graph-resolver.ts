@@ -5,6 +5,7 @@
 import type { Reference, Resource } from '../types/fhir.js';
 import { isResource, resourceKey } from '../types/fhir.js';
 import type { InputEntry, IntegrityWarning, ResourceIndex } from '../types/pipeline.js';
+import { parseReferenceTail } from '../shared/reference-tail.js';
 
 export const ORIGINAL_MEDICATION_REFERENCE_URL =
   'https://fhirbridge.dev/fhir/StructureDefinition/original-medication-reference';
@@ -14,9 +15,6 @@ export const MEDICATION_USAGE_TYPES: ReadonlySet<string> = new Set([
   'MedicationStatement',
   'MedicationDispense',
 ]);
-
-/** `…/Type/id` optionally followed by `/_history/n`. Groups: type, id, history suffix. */
-const REFERENCE_TAIL_RE = /([A-Za-z]+)\/([^/?#]+)((?:\/_history\/[^/]+)?)$/;
 
 function normalizeUrl(url: string): string {
   return url.toLowerCase().startsWith('urn:uuid:') ? url.toLowerCase() : url;
@@ -40,8 +38,8 @@ export function buildResourceIndex(entries: readonly InputEntry[]): ResourceInde
     }
     const direct = byKey.get(reference) ?? byUrl.get(normalizeUrl(reference));
     if (direct) return direct;
-    const tail = REFERENCE_TAIL_RE.exec(reference);
-    return tail ? byKey.get(`${tail[1]}/${tail[2]}`) : undefined;
+    const tail = parseReferenceTail(reference);
+    return tail ? byKey.get(`${tail.type}/${tail.id}`) : undefined;
   };
 
   return {
@@ -56,11 +54,11 @@ export function buildResourceIndex(entries: readonly InputEntry[]): ResourceInde
 
 /** Rewrite one reference string whose `Type/id` appears in `idMap`; otherwise return it unchanged. */
 export function rewriteReferenceString(reference: string, idMap: ReadonlyMap<string, string>): string {
-  const tail = REFERENCE_TAIL_RE.exec(reference);
+  const tail = parseReferenceTail(reference);
   if (!tail) return reference;
-  const replacement = idMap.get(`${tail[1]}/${tail[2]}`);
+  const replacement = idMap.get(`${tail.type}/${tail.id}`);
   if (!replacement) return reference;
-  return `${reference.slice(0, tail.index)}${tail[1]}/${replacement}${tail[3] ?? ''}`;
+  return `${tail.prefix}${tail.type}/${replacement}${tail.history}`;
 }
 
 /** Deep copy of `value` with every `reference` string rewritten through `idMap`. */
@@ -209,8 +207,8 @@ function findPatientKey(resource: Resource, index: ResourceIndex): string | unde
       if (target.resourceType === 'Patient') return resourceKey(target);
       continue;
     }
-    const tail = REFERENCE_TAIL_RE.exec(ref);
-    if (tail?.[1] === 'Patient') return `Patient/${tail[2]}`;
+    const tail = parseReferenceTail(ref);
+    if (tail?.type === 'Patient') return `Patient/${tail.id}`;
   }
   return undefined;
 }

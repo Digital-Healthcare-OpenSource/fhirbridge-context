@@ -21,16 +21,68 @@ function decodeEntities(text: string): string {
 
 export const collapseWhitespace = (text: string): string => text.replace(/\s+/g, ' ').trim();
 
+/** HTML inline tags glue words together; every other element separates them. */
+const INLINE_TAGS: ReadonlySet<string> = new Set([
+  'b', 'i', 'u', 'em', 'strong', 'span', 'font', 'a', 'sub', 'sup', 'small', 'big',
+]);
+const MAX_TAG_NAME = 32;
+
+/** Lower-cased element name right after `<` or `</` (empty for `<!…`, `<?…`, stray `<`). */
+function tagNameAt(markup: string, lt: number): string {
+  let j = markup.charAt(lt + 1) === '/' ? lt + 2 : lt + 1;
+  const start = j;
+  while (j < markup.length && j - start < MAX_TAG_NAME && /[A-Za-z0-9]/.test(markup.charAt(j))) j += 1;
+  return markup.slice(start, j).toLowerCase();
+}
+
+/**
+ * Markup to plain text in one linear pass (every search moves strictly forward). CDATA content is
+ * kept, comments and `script`/`style` bodies are dropped, inline tags join words, other tags
+ * separate them, and a `<` with no closing `>` is kept as literal text.
+ */
 export function stripMarkup(markup: string, joinInline = true): string {
-  const stripped = markup
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<[?!][^>]*>/g, ' ')
-    // HTML inline tags glue words together; XML elements always separate them.
-    .replace(joinInline ? /<\/?(?:b|i|u|em|strong|span|font|a|sub|sup|small|big)\b[^>]*>/gi : /(?!)/g, '')
-    .replace(/<[^>]*>/g, ' ');
-  return collapseWhitespace(decodeEntities(stripped));
+  const lower = markup.toLowerCase();
+  const out: string[] = [];
+  let i = 0;
+  while (i < markup.length) {
+    const lt = markup.indexOf('<', i);
+    if (lt < 0) {
+      out.push(markup.slice(i));
+      break;
+    }
+    out.push(markup.slice(i, lt));
+    if (markup.startsWith('<![CDATA[', lt)) {
+      const end = markup.indexOf(']]>', lt + 9);
+      out.push(end < 0 ? markup.slice(lt + 9) : markup.slice(lt + 9, end));
+      i = end < 0 ? markup.length : end + 3;
+      continue;
+    }
+    if (markup.startsWith('<!--', lt)) {
+      const end = markup.indexOf('-->', lt + 4);
+      if (end >= 0) {
+        out.push(' ');
+        i = end + 3;
+        continue;
+      }
+    }
+    const gt = markup.indexOf('>', lt + 1);
+    if (gt < 0) {
+      out.push(markup.slice(lt));
+      break;
+    }
+    const name = tagNameAt(markup, lt);
+    const isClosing = markup.charAt(lt + 1) === '/';
+    if (!isClosing && (name === 'script' || name === 'style')) {
+      const close = lower.indexOf(`</${name}`, gt + 1);
+      const closeEnd = close < 0 ? -1 : markup.indexOf('>', close);
+      out.push(' ');
+      i = closeEnd < 0 ? markup.length : closeEnd + 1; // unterminated script/style: drop the rest
+      continue;
+    }
+    out.push(joinInline && INLINE_TAGS.has(name) ? '' : ' ');
+    i = gt + 1;
+  }
+  return collapseWhitespace(decodeEntities(out.join('')));
 }
 
 const RTF_SKIPPED_DESTINATIONS: ReadonlySet<string> = new Set([

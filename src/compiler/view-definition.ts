@@ -122,8 +122,27 @@ function callFunction(name: string, arg: string, ec: EvalCtx): Scalar {
   }
 }
 
+const isWs = (ch: string): boolean => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+
+/**
+ * Split `a | b | c` on a `|` with whitespace on both sides (a bare `|` inside a function argument,
+ * such as a system regex `loinc|LOINC`, is not a separator). Linear scan instead of `/\s+\|\s+/`.
+ */
+function splitAlternatives(expr: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  for (let i = 1; i < expr.length - 1; i += 1) {
+    if (expr.charAt(i) === '|' && isWs(expr.charAt(i - 1)) && isWs(expr.charAt(i + 1))) {
+      parts.push(expr.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(expr.slice(start));
+  return parts;
+}
+
 function evalExpr(expr: string, ec: EvalCtx): Scalar {
-  for (const alternative of expr.split(/\s+\|\s+/)) {
+  for (const alternative of splitAlternatives(expr)) {
     const fn = /^(\w+)\((.*)\)$/.exec(alternative.trim());
     const value = fn
       ? callFunction(fn[1] as string, (fn[2] ?? '').trim(), ec)

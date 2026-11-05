@@ -7,6 +7,7 @@
  * Plain ids like `pat-1`, `obs-301` stay untouched.
  */
 import type { Resource } from '../types/fhir.js';
+import { parseReferenceTail, type ReferenceTail } from '../shared/reference-tail.js';
 import { collectIdentifierTerms } from './identifier-collect.js';
 import { collectNameVariants, collectNestedNames } from './name-collect.js';
 import { STOP_WORDS } from './scrub-name-patterns.js';
@@ -19,7 +20,13 @@ const SHORT_DATE_SHAPE = /\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}/;
 const PHONE_SHAPE = /\d{3}[-.\s]\d{3}[-.\s]\d{4}/;
 const LABEL_SHAPE = /(?:^|[^a-z])(?:mrn|ssn)(?:[^a-z]|$)/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const REFERENCE_TAIL = /^(.*?)([A-Z][A-Za-z]+)\/([^/?#]+)((?:\/_history\/[^/]+)?)$/;
+const RESOURCE_TYPE = /^[A-Z][A-Za-z]+$/;
+
+/** `…/Type/id[/_history/n]` where Type looks like a FHIR resource type (linear-time split). */
+function referenceTail(reference: string): ReferenceTail | undefined {
+  const tail = parseReferenceTail(reference);
+  return tail && RESOURCE_TYPE.test(tail.type) ? tail : undefined;
+}
 const PERSON_TYPES: ReadonlySet<string> = new Set(['Patient', 'Practitioner', 'RelatedPerson', 'Person']);
 const MIN_NAME_PART = 3;
 const MIN_IDENTIFIER_ALNUM = 5;
@@ -60,7 +67,7 @@ function personDisplays(resource: Resource): string[] {
     if (depth > 64) return;
     if (Array.isArray(value)) return value.forEach((v) => visit(v, depth + 1));
     if (!isObj(value)) return;
-    const type = typeof value.reference === 'string' ? REFERENCE_TAIL.exec(value.reference)?.[2] : value.type;
+    const type = typeof value.reference === 'string' ? referenceTail(value.reference)?.type : value.type;
     if (typeof value.display === 'string' && typeof type === 'string' && PERSON_TYPES.has(type)) out.push(value.display);
     for (const v of Object.values(value)) visit(v, depth + 1);
   };
@@ -112,10 +119,9 @@ export function createKeyMapper(resources: readonly Resource[], vault: SafeHarbo
   };
   const mapReference = (reference: string): string => {
     if (reference.startsWith('#') || reference.startsWith('urn:')) return reference;
-    const m = REFERENCE_TAIL.exec(reference);
+    const m = referenceTail(reference);
     if (!m) return reference;
-    const [, prefix = '', type = '', id = '', history = ''] = m;
-    return `${prefix}${type}/${mapId(type, id)}${history}`;
+    return `${m.prefix}${m.type}/${mapId(m.type, m.id)}${m.history}`;
   };
 
   /** Contained resources are local to one resource: an identifying local id is renamed with its `#refs`. */
