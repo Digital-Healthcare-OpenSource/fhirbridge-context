@@ -44,6 +44,13 @@ function computeCanonicalName(raw: string): string {
   return [...new Set(words)].sort().join(' ');
 }
 
+/** Remove trailing `/` characters with an index scan (a `/\/+$/` regex is quadratic on long runs). */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 0x2f) end -= 1;
+  return value.slice(0, end);
+}
+
 export function canonicalize(category: PhiCategory, raw: string): string {
   const trimmed = raw.trim();
   let out: string;
@@ -56,7 +63,7 @@ export function canonicalize(category: PhiCategory, raw: string): string {
     // "MRN-4471902" (structured) and "4471902" (free text after the label) are the same record number.
     if (category === 'MRN' && /^mrn\d/.test(out)) out = out.slice(3);
   } else if (category === 'EMAIL' || category === 'IP') out = trimmed.toLowerCase();
-  else if (category === 'URL') out = trimmed.toLowerCase().replace(/\/+$/, '');
+  else if (category === 'URL') out = trimTrailingSlashes(trimmed.toLowerCase());
   else out = trimmed.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
   return out || trimmed.toLowerCase();
 }

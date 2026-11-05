@@ -143,7 +143,10 @@ export function lintMedicationCodes(resource: Resource): IntegrityWarning[] {
 
 /* ------------------------------ medication normalization ------------------------------ */
 
-const STRENGTH_RE = /(\d+(?:\.\d+)?)\s*(mg|mcg|ug|g|ml|unit|units|iu|meq|%)(?:\s*\/\s*(\d+(?:\.\d+)?\s*)?(ml|hr|h|actuat))?/i;
+// Starts only at the beginning of a number (lookbehind) with bounded digit and space runs, so a
+// long run of digits or spaces without a unit cannot be re-scanned from every position.
+const STRENGTH_RE =
+  /(?<![\d.])(\d{1,7}(?:\.\d{1,4})?)[ \t]{0,3}(mg|mcg|ug|g|ml|unit|units|iu|meq|%)(?:[ \t]{0,3}\/[ \t]{0,3}(\d{1,7}(?:\.\d{1,4})?[ \t]{0,3})?(ml|hr|h|actuat))?/i;
 
 function parseStrength(text: string): string | undefined {
   const m = STRENGTH_RE.exec(text);

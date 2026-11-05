@@ -117,9 +117,13 @@ export function oneLine(value: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
 }
 
-/** Escape a value for a markdown table cell. */
+/**
+ * Escape a value for a markdown table cell. Backslashes are escaped first: otherwise an input
+ * ending in `\` before a `|` ("a\|b") would turn the added escape into a literal backslash and
+ * let the pipe split the column.
+ */
 export function cell(value: string): string {
-  return hideBinaryMarkers(value).replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+  return hideBinaryMarkers(value).replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
 }
 
 /** Best clinical date of a resource (raw FHIR date string). */
